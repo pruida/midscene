@@ -9,7 +9,8 @@ import { ChromeExtensionProxyPage, ChromeExtensionProxyPageAgent } from '@midsce
 // Prototype only: endpoints require a backend that does not yet exist.
 const SITE = 'https://ai.qykaiwu.cn';
 const PREFIX = '使用浏览器插件';
-const VIDEO_MAX_BYTES = 32 * 1024 * 1024;
+// Upload target is 18MB — under the front proxy's per-site cap; the backend
+// accepts up to 32MB.
 let active: { id: string; capability: string; sdk?: PlaygroundSDK; agent?: ChromeExtensionProxyPageAgent; abort: AbortController } | undefined;
 
 export function installQiyuanBridge() {
@@ -60,6 +61,9 @@ export function installQiyuanBridge() {
       await page.setActiveTabId(tab.id, { activate: false });
       const sdk = new PlaygroundSDK({ type: 'local-execution', agentFactory: () => {
         const agent = new ChromeExtensionProxyPageAgent(page, {
+        // Multi-step collection tasks (e.g. "汇总50条结果") legitimately need
+        // many planning rounds; the upstream default of 20 aborts them.
+        replanningCycleLimit: 100,
         // SDK constructor requires a nonempty value; this sentinel is not a key
         // and the custom client never transmits it.
         modelConfig: { MIDSCENE_MODEL_NAME: 'gpt-6-astra', MIDSCENE_MODEL_FAMILY: message.modelFamily, MIDSCENE_MODEL_API_KEY: 'not-a-secret', MIDSCENE_MODEL_BASE_URL: `${SITE}/api/browser-plugin/tasks/${message.taskId}/model`, MIDSCENE_MODEL_STREAM_MODE: 'non-stream', MIDSCENE_MODEL_PROTOCOL: 'openai-responses' },
@@ -84,6 +88,19 @@ export function installQiyuanBridge() {
       } catch (error) {
         outcome = { error: error instanceof Error ? error.message : String(error) };
       }
+      // aiAct 只描述"做了什么动作"；用户要的是页面上的实际内容。
+      // 任务成功后追加一次 aiAsk，基于当前页面总结与指令相关的内容。
+      if (!(outcome && typeof outcome === 'object' && 'error' in (outcome as Record<string, unknown>))) {
+        try {
+          const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: `用户刚才要求在网页上完成：「${prompt}」。请基于当前页面的实际内容，用简洁中文汇总用户想要的结果本身（例如搜索到的主要信息/条目），不要描述执行了哪些操作，300 字以内。` }, { requestId: `${message.taskId}-ask`, abortSignal: abort.signal });
+          const answer = typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : '');
+          if (answer.trim()) {
+            outcome = outcome && typeof outcome === 'object' && !Array.isArray(outcome)
+              ? { ...(outcome as Record<string, unknown>), result: answer }
+              : { result: answer };
+          }
+        } catch { /* 摘要失败不阻断，保留原 outcome */ }
+      }
       // Best-effort terminal artifact: replay video. The result text itself is
       // posted to /result and shown in the conversation; no report page.
       let videoUploaded = false;
@@ -101,10 +118,16 @@ export function installQiyuanBridge() {
           if (!scripts.length) throw new Error('No replay frames in dump');
           const frameMap = calculateFrameMap(scripts, { imageWidth: info?.width, imageHeight: info?.height });
           // The popup page may be hidden during upload; rAF never fires
-          // there, so drive the render loop with timers.
-          const video = await exportBrandedVideoBlob(frameMap, { timerDriven: true });
+          // there, so drive the render loop with timers. Cap the bitrate and
+          // retry lower if needed: a long task at the default bitrate easily
+          // exceeds the front proxy's upload limit.
+          const TARGET_MAX = 18 * 1024 * 1024;
+          let video = await exportBrandedVideoBlob(frameMap, { timerDriven: true, videoBitsPerSecond: 1_500_000 });
+          if (video.size > TARGET_MAX) {
+            video = await exportBrandedVideoBlob(frameMap, { timerDriven: true, videoBitsPerSecond: 500_000 });
+          }
           if (video.size === 0) throw new Error('Empty video');
-          if (video.size > VIDEO_MAX_BYTES) throw new Error('Video exceeds 32MB limit');
+          if (video.size > TARGET_MAX) throw new Error('视频过大，超出上传限制');
           await requestBinary('video', video, abort.signal);
           videoUploaded = true;
         } catch (error) {

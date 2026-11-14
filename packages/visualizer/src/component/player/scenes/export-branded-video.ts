@@ -377,6 +377,12 @@ export interface ExportBrandedVideoOptions {
    * pages). The recorded stream still advances in real time.
    */
   timerDriven?: boolean;
+  /**
+   * Cap the MediaRecorder bitrate (bits/second). Long tasks at the default
+   * bitrate easily exceed upload limits, so callers can trade quality for
+   * size (e.g. 1.5Mbps, then retry lower).
+   */
+  videoBitsPerSecond?: number;
 }
 
 export async function exportBrandedVideo(
@@ -471,7 +477,12 @@ async function runExportBrandedVideo(
         requestFrame?: () => void;
       } | undefined)
     : undefined;
-  const recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+  const recorder = new MediaRecorder(stream, {
+    mimeType: 'video/webm',
+    ...(options?.videoBitsPerSecond
+      ? { videoBitsPerSecond: options.videoBitsPerSecond }
+      : {}),
+  });
   const chunks: BlobPart[] = [];
   recorder.ondataavailable = (e) => {
     if (e.data.size > 0) chunks.push(e.data);
