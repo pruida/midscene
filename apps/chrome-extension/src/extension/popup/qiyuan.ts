@@ -5,12 +5,12 @@ import {
   exportBrandedVideoBlob,
 } from '@midscene/visualizer';
 import { ChromeExtensionProxyPage, ChromeExtensionProxyPageAgent } from '@midscene/web/chrome-extension';
+import { saveReplayVideo } from '../replay-store';
 
 // Prototype only: endpoints require a backend that does not yet exist.
 const SITE = 'https://ai.qykaiwu.cn';
 const PREFIX = '使用浏览器插件';
-// Upload target is 18MB — under the front proxy's per-site cap; the backend
-// accepts up to 32MB.
+// Replay videos are rendered and stored locally (IndexedDB), never uploaded.
 let active: { id: string; capability: string; sdk?: PlaygroundSDK; agent?: ChromeExtensionProxyPageAgent; abort: AbortController } | undefined;
 
 export function installQiyuanBridge() {
@@ -51,11 +51,6 @@ export function installQiyuanBridge() {
         // forever (the chat page would wait silently for the full 2h TTL).
         const signals = [signal, AbortSignal.timeout(180_000)].filter((s): s is AbortSignal => !!s);
         const res = await fetch(`${url}/${path}`, { method: 'POST', credentials: 'omit', redirect: 'error', signal: AbortSignal.any(signals), headers: { 'content-type': 'application/json', authorization: `Bearer ${message.capability}` }, body: JSON.stringify(data) });
-        if (!res.ok) throw new Error(`Backend HTTP ${res.status}`);
-        return res.json();
-      };
-      const requestBinary = async (path: string, body: Blob, signal?: AbortSignal) => {
-        const res = await fetch(`${url}/${path}`, { method: 'POST', credentials: 'omit', redirect: 'error', signal, headers: { 'content-type': 'video/webm', authorization: `Bearer ${message.capability}` }, body });
         if (!res.ok) throw new Error(`Backend HTTP ${res.status}`);
         return res.json();
       };
@@ -111,11 +106,23 @@ export function installQiyuanBridge() {
       try {
         outcome = await sdk.executeAction('aiAct', { type: 'aiAct', prompt }, { requestId: message.taskId, abortSignal: abort.signal });
       } catch (error) {
-        outcome = { error: error instanceof Error ? error.message : String(error) };
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (/planning cycle limit|replanningCycleLimit/i.test(errorMessage)) {
+          // 超过规划轮次上限：不要把英文报错糊给用户，基于已完成的工作汇总部分结果。
+          pushTip('已达步数上限，正在汇总已完成部分…');
+          let partialSummary = '';
+          try {
+            const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: `用户要求在网页上完成：「${prompt}」。任务因步数较多被提前结束。请基于当前页面的实际内容和目前已完成的工作，用简洁中文汇总已经收集到的结果/进展（300 字以内）；如果还没有收集到任何内容，就直接说"暂无有效结果"。` }, { requestId: `${message.taskId}-partial`, abortSignal: abort.signal });
+            partialSummary = typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : '');
+          } catch { /* 汇总失败时给出兜底文案 */ }
+          outcome = { result: partialSummary.trim() || '任务因步数较多提前结束，未能收集到有效结果。', partial: true };
+        } else {
+          outcome = { error: errorMessage };
+        }
       }
       // aiAct 只描述"做了什么动作"；用户要的是页面上的实际内容。
       // 任务成功后追加一次 aiAsk，基于当前页面总结与指令相关的内容。
-      if (!(outcome && typeof outcome === 'object' && 'error' in (outcome as Record<string, unknown>))) {
+      if (!(outcome && typeof outcome === 'object' && ('error' in (outcome as Record<string, unknown>) || 'partial' in (outcome as Record<string, unknown>)))) {
         pushTip('正在汇总结果…');
         try {
           const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: `用户刚才要求在网页上完成：「${prompt}」。请基于当前页面的实际内容，用简洁中文汇总用户想要的结果本身（例如搜索到的主要信息/条目），不要描述执行了哪些操作，300 字以内。` }, { requestId: `${message.taskId}-ask`, abortSignal: abort.signal });
@@ -127,9 +134,11 @@ export function installQiyuanBridge() {
           }
         } catch { /* 摘要失败不阻断，保留原 outcome */ }
       }
-      // Best-effort terminal artifact: replay video. The result text itself is
-      // posted to /result and shown in the conversation; no report page.
-      let videoUploaded = false;
+      // Best-effort terminal artifact: replay video. Rendered locally and kept
+      // in the extension's IndexedDB — never uploaded, so the server spends
+      // zero storage/bandwidth on videos. The chat page links to the local
+      // replay player page instead.
+      let videoAvailable = false;
       let videoError: string | undefined;
       const agent = reservation.agent;
       if (agent) {
@@ -143,24 +152,24 @@ export function installQiyuanBridge() {
           const scripts = info?.scripts ?? [];
           if (!scripts.length) throw new Error('No replay frames in dump');
           const frameMap = calculateFrameMap(scripts, { imageWidth: info?.width, imageHeight: info?.height });
-          // The popup page may be hidden during upload; rAF never fires
+          // The popup page may be hidden during the render; rAF never fires
           // there, so drive the render loop with timers. Cap the bitrate and
-          // retry lower if needed: a long task at the default bitrate easily
-          // exceeds the front proxy's upload limit.
-          const TARGET_MAX = 18 * 1024 * 1024;
+          // retry lower if needed to bound local disk usage.
+          const TARGET_MAX = 32 * 1024 * 1024;
           let video = await exportBrandedVideoBlob(frameMap, { timerDriven: true, videoBitsPerSecond: 1_500_000 });
           if (video.size > TARGET_MAX) {
             video = await exportBrandedVideoBlob(frameMap, { timerDriven: true, videoBitsPerSecond: 500_000 });
           }
           if (video.size === 0) throw new Error('Empty video');
-          if (video.size > TARGET_MAX) throw new Error('视频过大，超出上传限制');
-          await requestBinary('video', video, abort.signal);
-          videoUploaded = true;
+          if (video.size > TARGET_MAX) throw new Error('视频过大，无法保存');
+          abort.signal.throwIfAborted();
+          await saveReplayVideo(message.taskId, video);
+          videoAvailable = true;
         } catch (error) {
           videoError = error instanceof Error ? error.message : String(error);
         }
       }
-      const uploadOutcome = { videoUploaded, ...(videoError ? { videoError } : {}) };
+      const uploadOutcome = { videoAvailable, ...(videoError ? { videoError } : {}) };
       // The action outcome carries heavy fields (dump with base64 screenshots,
       // report HTML, logs) — far over the backend's 256KB result cap, and
       // unreadable in chat anyway. Summarize: drop known-heavy keys, drop

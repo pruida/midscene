@@ -36,6 +36,7 @@ export default defineConfig({
           siwc: './src/extension/siwc/index.tsx',
           popup: './src/extension/popup/index.tsx',
           confirm: './src/extension/confirm/index.tsx',
+          replay: './src/extension/replay/index.tsx',
         },
       },
       html: {
