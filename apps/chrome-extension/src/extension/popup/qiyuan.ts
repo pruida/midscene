@@ -9,7 +9,6 @@ import { ChromeExtensionProxyPage, ChromeExtensionProxyPageAgent } from '@midsce
 // Prototype only: endpoints require a backend that does not yet exist.
 const SITE = 'https://ai.qykaiwu.cn';
 const PREFIX = '使用浏览器插件';
-const REPORT_MAX_BYTES = 8 * 1024 * 1024;
 const VIDEO_MAX_BYTES = 32 * 1024 * 1024;
 let active: { id: string; capability: string; sdk?: PlaygroundSDK; agent?: ChromeExtensionProxyPageAgent; abort: AbortController } | undefined;
 
@@ -85,24 +84,12 @@ export function installQiyuanBridge() {
       } catch (error) {
         outcome = { error: error instanceof Error ? error.message : String(error) };
       }
-      // Best-effort terminal artifacts: report HTML and replay video.
-      // Failures here must never mask the task result; they are recorded
-      // as extension fields on the reported outcome instead.
-      let reportUploaded = false;
+      // Best-effort terminal artifact: replay video. The result text itself is
+      // posted to /result and shown in the conversation; no report page.
       let videoUploaded = false;
-      let reportError: string | undefined;
       let videoError: string | undefined;
       const agent = reservation.agent;
       if (agent) {
-        try {
-          const html = agent.reportHTMLString();
-          if (!html) throw new Error('Empty report');
-          if (new TextEncoder().encode(html).byteLength > REPORT_MAX_BYTES) throw new Error('Report exceeds 8MB limit');
-          await request('report', { html }, abort.signal);
-          reportUploaded = true;
-        } catch (error) {
-          reportError = error instanceof Error ? error.message : String(error);
-        }
         try {
           // The playground adapter finalizes the agent report after execution,
           // which releases dump memory; the action result carries its own dump.
@@ -124,10 +111,10 @@ export function installQiyuanBridge() {
           videoError = error instanceof Error ? error.message : String(error);
         }
       }
-      const uploadOutcome = { reportUploaded, videoUploaded, ...(reportError ? { reportError } : {}), ...(videoError ? { videoError } : {}) };
+      const uploadOutcome = { videoUploaded, ...(videoError ? { videoError } : {}) };
       // The action outcome carries a `dump` with base64 screenshots — far over
       // the backend's 256KB result cap. Strip it (and any oversize residue);
-      // the report/video uploads above are the durable artifacts.
+      // the video upload above is the durable artifact.
       const slim = (value: unknown): unknown => {
         if (value && typeof value === 'object' && !Array.isArray(value)) {
           const { dump: _dump, ...rest } = value as Record<string, unknown>;
@@ -139,14 +126,25 @@ export function installQiyuanBridge() {
         ? { ...(slim(outcome) as Record<string, unknown>), ...uploadOutcome }
         : { result: slim(outcome), ...uploadOutcome };
       if (new TextEncoder().encode(JSON.stringify(finalOutcome)).byteLength > 200 * 1024) {
-        finalOutcome = { note: '结果过大已省略，请查看执行报告与过程视频', ...uploadOutcome };
+        finalOutcome = { note: '结果过大已省略，请回看过程视频', ...uploadOutcome };
       }
       await request('result', { outcome: finalOutcome, cancelled: abort.signal.aborted });
       } catch (error) {
         // The chat page only learns the outcome from the backend; never let a
         // failure above (uploads, result post) leave the task unterminated.
         try { await request('result', { outcome: { error: error instanceof Error ? error.message : String(error) }, cancelled: reservation.abort.signal.aborted }); } catch { /* backend unreachable */ }
-      } finally { if (active === reservation) active = undefined; }
+      } finally {
+        if (active === reservation) active = undefined;
+        // The task ran on an auto-created tab; bring the chat tab back into
+        // focus so the user lands on the conversation with the result.
+        if (typeof message.targetTabId === 'number' && message.targetTabId > 0) {
+          try {
+            const chatTab = await chrome.tabs.get(message.targetTabId);
+            if (chatTab?.windowId != null) await chrome.windows.update(chatTab.windowId, { focused: true });
+            await chrome.tabs.update(message.targetTabId, { active: true });
+          } catch { /* chat tab already gone */ }
+        }
+      }
     })().then((value) => { if (value !== undefined) respond(value); }, (e) => respond({ ok: false, error: String(e?.message || e) }));
     return true;
   };
