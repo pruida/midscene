@@ -32,13 +32,13 @@ export function installQiyuanBridge() {
       const reservation = { id: message.taskId as string, capability: message.capability as string, abort: new AbortController(), sdk: undefined as PlaygroundSDK | undefined, agent: undefined as ChromeExtensionProxyPageAgent | undefined };
       active = reservation;
       try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      // Open a fresh tab for every task: the chat page and the user's other
+      // tabs are never navigated, and the model drives this tab end to end.
+      // The explicit 「使用浏览器插件」 prefix is the user's consent, so no
+      // extra confirm dialog is needed.
+      const tab = await chrome.tabs.create({ url: 'about:blank', active: true });
       reservation.abort.signal.throwIfAborted();
-      // targetTabId is the chat tab (injected by the service worker). The task
-      // must run on the user's active tab instead — never navigate the chat away.
-      if (!tab?.id || !tab.url || !/^https?:\/\//.test(tab.url)) throw new Error('Select a normal web page first');
-      if (tab.id === message.targetTabId) throw new Error('请先切换到要操作的网页标签页（不要停留在聊天页），再重新下发任务');
-      if (!window.confirm(`Allow browser task on ${new URL(tab.url).origin}?\n\n${prompt}`)) throw new Error('User declined');
+      if (!tab?.id) throw new Error('无法新建任务标签页');
       const abort = reservation.abort;
       const url = `${SITE}/api/browser-plugin/tasks/${message.taskId}`;
       const request = async (path: string, data: unknown, signal?: AbortSignal) => {
