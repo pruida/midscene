@@ -31,7 +31,6 @@ export function installQiyuanBridge() {
       if (typeof message.modelFamily !== 'string' || !supportedFamilies.includes(message.modelFamily)) throw new Error('Unsupported or missing server model family');
       const reservation = { id: message.taskId as string, capability: message.capability as string, abort: new AbortController(), sdk: undefined as PlaygroundSDK | undefined, agent: undefined as ChromeExtensionProxyPageAgent | undefined };
       active = reservation;
-      try {
       // Open a fresh tab for every task: the chat page and the user's other
       // tabs are never navigated, and the model drives this tab end to end.
       // The explicit 「使用浏览器插件」 prefix is the user's consent, so no
@@ -39,6 +38,12 @@ export function installQiyuanBridge() {
       const tab = await chrome.tabs.create({ url: 'about:blank', active: true });
       reservation.abort.signal.throwIfAborted();
       if (!tab?.id) throw new Error('无法新建任务标签页');
+      // Acknowledge immediately: the task may run for minutes, and an MV3
+      // service worker waiting on this respond can be killed mid-wait, which
+      // would leave the chat page stuck forever. From here on the page
+      // tracks the task by polling the backend, so the final state must
+      // always reach /result — even when the steps below fail.
+      respond({ ok: true, taskId: message.taskId, started: true });
       const abort = reservation.abort;
       const url = `${SITE}/api/browser-plugin/tasks/${message.taskId}`;
       const request = async (path: string, data: unknown, signal?: AbortSignal) => {
@@ -51,6 +56,7 @@ export function installQiyuanBridge() {
         if (!res.ok) throw new Error(`Backend HTTP ${res.status}`);
         return res.json();
       };
+      try {
       const page = new ChromeExtensionProxyPage(true);
       await page.setActiveTabId(tab.id, { activate: false });
       const sdk = new PlaygroundSDK({ type: 'local-execution', agentFactory: () => {
@@ -119,13 +125,29 @@ export function installQiyuanBridge() {
         }
       }
       const uploadOutcome = { reportUploaded, videoUploaded, ...(reportError ? { reportError } : {}), ...(videoError ? { videoError } : {}) };
-      const finalOutcome = outcome && typeof outcome === 'object' && !Array.isArray(outcome)
-        ? { ...(outcome as Record<string, unknown>), ...uploadOutcome }
-        : { result: outcome, ...uploadOutcome };
+      // The action outcome carries a `dump` with base64 screenshots — far over
+      // the backend's 256KB result cap. Strip it (and any oversize residue);
+      // the report/video uploads above are the durable artifacts.
+      const slim = (value: unknown): unknown => {
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          const { dump: _dump, ...rest } = value as Record<string, unknown>;
+          return rest;
+        }
+        return value;
+      };
+      let finalOutcome: Record<string, unknown> = outcome && typeof outcome === 'object' && !Array.isArray(outcome)
+        ? { ...(slim(outcome) as Record<string, unknown>), ...uploadOutcome }
+        : { result: slim(outcome), ...uploadOutcome };
+      if (new TextEncoder().encode(JSON.stringify(finalOutcome)).byteLength > 200 * 1024) {
+        finalOutcome = { note: '结果过大已省略，请查看执行报告与过程视频', ...uploadOutcome };
+      }
       await request('result', { outcome: finalOutcome, cancelled: abort.signal.aborted });
-      return { ok: true, taskId: message.taskId, cancelled: abort.signal.aborted };
+      } catch (error) {
+        // The chat page only learns the outcome from the backend; never let a
+        // failure above (uploads, result post) leave the task unterminated.
+        try { await request('result', { outcome: { error: error instanceof Error ? error.message : String(error) }, cancelled: reservation.abort.signal.aborted }); } catch { /* backend unreachable */ }
       } finally { if (active === reservation) active = undefined; }
-    })().then(respond, (e) => respond({ ok: false, error: String(e?.message || e) }));
+    })().then((value) => { if (value !== undefined) respond(value); }, (e) => respond({ ok: false, error: String(e?.message || e) }));
     return true;
   };
   chrome.runtime.onMessage.addListener(listener);
