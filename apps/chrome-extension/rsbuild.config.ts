@@ -41,9 +41,9 @@ export default defineConfig({
       html: {
         title: ({ entryName }) => {
           if (entryName === 'confirm') {
-            return 'Midscene Bridge';
+            return '启源浏览器助手 Bridge';
           }
-          return 'Midscene';
+          return '启源浏览器助手';
         },
       },
       output: {

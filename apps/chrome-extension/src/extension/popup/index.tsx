@@ -18,6 +18,7 @@ import { App as AntdApp, ConfigProvider, Dropdown, theme } from 'antd';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { BrowserExtensionPlayground } from '../../components/playground';
 import Bridge from '../bridge';
+import { installQiyuanBridge } from './qiyuan';
 import Recorder from '../recorder';
 import { SiwcLoginButton } from '../siwc/button';
 import './index.less';
@@ -106,6 +107,7 @@ function loadAgentOptions(): CommonAgentOptions {
 }
 
 export function PlaygroundPopup() {
+  useEffect(() => installQiyuanBridge(), []);
   const setPopupTab = useEnvConfig((state) => state.setPopupTab);
   const [playgroundSDK, setPlaygroundSDK] = useState<PlaygroundSDK | null>(
     null,

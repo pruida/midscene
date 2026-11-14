@@ -444,6 +444,20 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 });
 
+// Only the trusted first-party top-level page can ask the open side panel to run.
+chrome.runtime.onMessageExternal.addListener((request, sender, sendResponse) => {
+  let trusted = false;
+  try { trusted = new URL(sender.url || '').origin === 'https://ai.qykaiwu.cn'; } catch {}
+  if (!trusted || sender.frameId !== 0 || sender.tab?.id == null || !['run', 'cancel'].includes(request?.type)) {
+    sendResponse({ ok: false, error: 'Untrusted sender' });
+    return false;
+  }
+  // The page cannot know its own tab id; record the chat tab here so the bridge
+  // can refuse to navigate it away and instead run on the user's active tab.
+  chrome.runtime.sendMessage({ ...request, targetTabId: sender.tab.id, channel: 'qiyuan-verified' }).then(sendResponse, () => sendResponse({ ok: false, error: 'Open the Qiyuan side panel first' }));
+  return true;
+});
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === SIWC_LOGIN_MESSAGE) {
     if (sender.id !== chrome.runtime.id || sender.tab) {
