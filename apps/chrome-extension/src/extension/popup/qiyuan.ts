@@ -112,21 +112,44 @@ export function installQiyuanBridge() {
         }
       }
       const uploadOutcome = { videoUploaded, ...(videoError ? { videoError } : {}) };
-      // The action outcome carries a `dump` with base64 screenshots — far over
-      // the backend's 256KB result cap. Strip it (and any oversize residue);
-      // the video upload above is the durable artifact.
-      const slim = (value: unknown): unknown => {
-        if (value && typeof value === 'object' && !Array.isArray(value)) {
-          const { dump: _dump, ...rest } = value as Record<string, unknown>;
-          return rest;
+      // The action outcome carries heavy fields (dump with base64 screenshots,
+      // report HTML, logs) — far over the backend's 256KB result cap, and
+      // unreadable in chat anyway. Summarize: drop known-heavy keys, drop
+      // embedded images, truncate long strings, keep the model's actual answer.
+      const HEAVY_KEYS = /^(dump|reportHTML|report|screenshots?|taskLog|logs?|elements?|pageData|rawResponse)$/i;
+      const slim = (value: unknown, depth = 0): unknown => {
+        if (value == null || depth > 6) return value == null ? value : undefined;
+        if (typeof value === 'string') {
+          if (/^data:image\//.test(value)) return undefined;
+          return value.length > 3000 ? value.slice(0, 3000) + '…（已截断）' : value;
         }
-        return value;
+        if (typeof value !== 'object') return value;
+        if (Array.isArray(value)) {
+          const arr = value.map(v => slim(v, depth + 1)).filter(v => v !== undefined);
+          return arr.length > 50 ? arr.slice(0, 50) : arr;
+        }
+        const out: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+          if (HEAVY_KEYS.test(k)) continue;
+          const s = slim(v, depth + 1);
+          if (s !== undefined) out[k] = s;
+        }
+        return out;
       };
       let finalOutcome: Record<string, unknown> = outcome && typeof outcome === 'object' && !Array.isArray(outcome)
         ? { ...(slim(outcome) as Record<string, unknown>), ...uploadOutcome }
         : { result: slim(outcome), ...uploadOutcome };
-      if (new TextEncoder().encode(JSON.stringify(finalOutcome)).byteLength > 200 * 1024) {
-        finalOutcome = { note: '结果过大已省略，请回看过程视频', ...uploadOutcome };
+      const byteLen = (o: unknown) => new TextEncoder().encode(JSON.stringify(o)).byteLength;
+      if (byteLen(finalOutcome) > 200 * 1024) {
+        // Still oversized: keep only the answer-shaped fields.
+        const o = finalOutcome as Record<string, unknown>;
+        finalOutcome = {
+          result: String(o.result ?? o.thought ?? o.output ?? o.text ?? '任务已完成').slice(0, 8000),
+          ...uploadOutcome,
+        };
+      }
+      if (byteLen(finalOutcome) > 200 * 1024) {
+        finalOutcome = { result: '任务已完成（结果超出对话容量，请回看过程视频）', ...uploadOutcome };
       }
       await request('result', { outcome: finalOutcome, cancelled: abort.signal.aborted });
       } catch (error) {
