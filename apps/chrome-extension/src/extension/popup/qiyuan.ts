@@ -47,7 +47,10 @@ export function installQiyuanBridge() {
       const abort = reservation.abort;
       const url = `${SITE}/api/browser-plugin/tasks/${message.taskId}`;
       const request = async (path: string, data: unknown, signal?: AbortSignal) => {
-        const res = await fetch(`${url}/${path}`, { method: 'POST', credentials: 'omit', redirect: 'error', signal, headers: { 'content-type': 'application/json', authorization: `Bearer ${message.capability}` }, body: JSON.stringify(data) });
+        // Bound every backend call: an upstream stall must not freeze the task
+        // forever (the chat page would wait silently for the full 2h TTL).
+        const signals = [signal, AbortSignal.timeout(180_000)].filter((s): s is AbortSignal => !!s);
+        const res = await fetch(`${url}/${path}`, { method: 'POST', credentials: 'omit', redirect: 'error', signal: AbortSignal.any(signals), headers: { 'content-type': 'application/json', authorization: `Bearer ${message.capability}` }, body: JSON.stringify(data) });
         if (!res.ok) throw new Error(`Backend HTTP ${res.status}`);
         return res.json();
       };
@@ -57,6 +60,18 @@ export function installQiyuanBridge() {
         return res.json();
       };
       try {
+      // Live progress: the SDK's onProgressUpdate is never fired by the local
+      // adapter, so derive tips from the agent's execution dump instead —
+      // each model round-trip updates it. Throttled + deduped posts.
+      let lastTip = '';
+      let lastTipAt = 0;
+      const pushTip = (tip: string) => {
+        const clean = tip.replace(/\s+/g, ' ').trim().slice(0, 140);
+        const now = Date.now();
+        if (!clean || (clean === lastTip && now - lastTipAt < 60_000) || now - lastTipAt < 1500) return;
+        lastTip = clean; lastTipAt = now;
+        void request('progress', { tip: clean }, abort.signal).catch(() => {});
+      };
       const page = new ChromeExtensionProxyPage(true);
       await page.setActiveTabId(tab.id, { activate: false });
       const sdk = new PlaygroundSDK({ type: 'local-execution', agentFactory: () => {
@@ -77,11 +92,21 @@ export function installQiyuanBridge() {
         } }),
       });
         reservation.agent = agent;
+        agent.addDumpUpdateListener((_dumpStr: string, execDump: any) => {
+          try {
+            const executions = execDump?.executions || [];
+            const latest = executions[executions.length - 1];
+            const tasks = latest?.tasks || [];
+            const current = [...tasks].reverse().find((t: any) => t?.status === 'running') || tasks[tasks.length - 1];
+            const what = current?.thought || current?.name || '';
+            pushTip(`执行中 · 第 ${executions.length} 轮${what ? ' · ' + what : ''}`);
+          } catch { /* tip 推导失败不影响执行 */ }
+        });
         return agent;
       } });
       reservation.sdk = sdk;
       abort.signal.throwIfAborted();
-      sdk.onProgressUpdate((tip: string) => { void request('progress', { tip }, abort.signal).catch(() => {}); });
+      pushTip('任务已下发，正在启动…');
       let outcome: unknown;
       try {
         outcome = await sdk.executeAction('aiAct', { type: 'aiAct', prompt }, { requestId: message.taskId, abortSignal: abort.signal });
@@ -91,6 +116,7 @@ export function installQiyuanBridge() {
       // aiAct 只描述"做了什么动作"；用户要的是页面上的实际内容。
       // 任务成功后追加一次 aiAsk，基于当前页面总结与指令相关的内容。
       if (!(outcome && typeof outcome === 'object' && 'error' in (outcome as Record<string, unknown>))) {
+        pushTip('正在汇总结果…');
         try {
           const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: `用户刚才要求在网页上完成：「${prompt}」。请基于当前页面的实际内容，用简洁中文汇总用户想要的结果本身（例如搜索到的主要信息/条目），不要描述执行了哪些操作，300 字以内。` }, { requestId: `${message.taskId}-ask`, abortSignal: abort.signal });
           const answer = typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : '');
