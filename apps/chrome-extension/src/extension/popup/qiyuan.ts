@@ -68,14 +68,65 @@ export function installQiyuanBridge() {
       const postProgress = (force = false) => {
         const now = Date.now();
         // Send the tail: long tasks only need recent steps for live display.
-        const tail = steps.slice(-30).map(s => ({
-          k: s.kind.slice(0, 40), t: s.text.slice(0, 160), s: s.status, ts: s.ts,
+        // 后端 steps 字段硬上限 6000 字节，超了整包 400 静默丢弃（进度就冻结在
+        // 最后一次成功的样子）。这里按字节预算自适应：先砍每条文本长度、再砍条数。
+        const byteLen = (v: unknown) => new TextEncoder().encode(JSON.stringify(v)).length;
+        const buildTail = (count: number, textLen: number) => steps.slice(-count).map(s => ({
+          k: s.kind.slice(0, 40), t: s.text.slice(0, textLen), s: s.status, ts: s.ts,
           ...(s.durationMs != null ? { d: Math.round(s.durationMs) } : {}),
         }));
+        let tail = buildTail(30, 160);
+        for (const [count, len] of [[30, 80], [20, 80], [12, 60], [8, 40], [5, 40]] as const) {
+          if (byteLen(tail) <= 5400) break;
+          tail = buildTail(count, len);
+        }
         const sig = `${lastTip}|${tail.length}|${tail.map(s => s.s + String(s.d ?? '')).join(',')}`;
+        renderPanel();
         if (!force && (now - lastPostAt < 1500 || sig === lastPostSig)) return;
         lastPostAt = now; lastPostSig = sig;
         void request('progress', { tip: lastTip, steps: tail, totalSteps: steps.length }, abort.signal).catch(() => {});
+      };
+      // 侧边栏实时进度：本文件就跑在侧边栏页面里，直接把同一份步骤时间线
+      // 渲染进面板 DOM，不看对话页也能跟踪任务。终态保留显示直到下个任务。
+      let panelState: 'running' | 'done' | 'failed' | 'cancelled' = 'running';
+      let panelResultText = '';
+      const renderPanel = () => {
+        try {
+          if (typeof document === 'undefined') return;
+          let root = document.getElementById('qiyuan-live-progress') as HTMLDivElement | null;
+          if (!root) {
+            root = document.createElement('div');
+            root.id = 'qiyuan-live-progress';
+            (document.body || document.documentElement).appendChild(root);
+          }
+          const esc = (v: unknown) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          const fmtDur = (ms?: number) => {
+            if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) return '';
+            const s = ms / 1000;
+            return s >= 60 ? `${Math.floor(s / 60)}分${Math.round(s % 60)}秒` : s >= 10 ? `${Math.round(s)}秒` : `${s.toFixed(1)}秒`;
+          };
+          const fmtTime = (ts: number) => { const d = new Date(ts); const p = (n: number) => String(n).padStart(2, '0'); return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; };
+          const headMap = {
+            running: ['#3b82f6', '● 任务执行中'],
+            done: ['#22a06b', '✓ 任务已完成'],
+            failed: ['#c00', '✗ 任务失败'],
+            cancelled: ['#c00', '■ 任务已取消'],
+          } as const;
+          const [color, headText] = headMap[panelState];
+          const rows = steps.slice(-60).map((s) => {
+            const icon = s.status === 'done' ? '<span style="color:#22a06b">✓</span>'
+              : s.status === 'failed' ? '<span style="color:#c00">✗</span>'
+              : '<span style="color:#3b82f6">●</span>';
+            const dur = s.durationMs != null ? `<span style="color:#999;margin-left:6px;white-space:nowrap">${fmtDur(s.durationMs)}</span>` : '';
+            return `<div style="display:flex;gap:6px;align-items:baseline;padding:2px 0">${icon}<span style="color:#999;font-variant-numeric:tabular-nums;white-space:nowrap">${fmtTime(s.ts)}</span><div style="min-width:0"><b>${esc(s.kind)}</b> <span style="color:#555;overflow-wrap:anywhere">${esc(s.text)}</span>${dur}</div></div>`;
+          }).join('');
+          root.style.cssText = 'position:fixed;inset:0;background:#fff;z-index:9999;overflow-y:auto;padding:16px;font:13px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;box-sizing:border-box';
+          root.innerHTML = `<div style="font-size:15px;font-weight:600;color:${color};margin-bottom:6px">${headText}</div>`
+            + (lastTip ? `<div style="color:#666;font-size:12px;margin-bottom:10px">${esc(lastTip)}</div>` : '')
+            + (panelResultText ? `<div style="color:#333;font-size:13px;margin-bottom:10px;white-space:pre-wrap;overflow-wrap:anywhere">${esc(panelResultText)}</div>` : '')
+            + `<div style="border-left:2px solid #e5e7eb;padding-left:10px">${rows}</div>`;
+          root.scrollTop = root.scrollHeight;
+        } catch { /* 面板渲染失败不影响任务 */ }
       };
       const pushTip = (tip: string) => {
         const clean = tip.replace(/\s+/g, ' ').trim().slice(0, 140);
@@ -222,7 +273,7 @@ export function installQiyuanBridge() {
         const linkBlock = links
           ? `\n\n以下是执行过程中从页面 DOM 提取的真实链接列表（锚文本 → 网址）。如果任务要求附带链接：每一条结果的标题/来源必须写成可点击的 markdown 链接（格式：[标题](网址)），直接嵌在表格或列表的对应行里——读者看到感兴趣的条目要能立即点开原文，只把链接堆在文末是不可接受的。网址必须只取自下面列表，禁止编造或猜测任何不在列表中的链接；列表里找不到合适链接的条目，该行就不放链接（保留纯文本标题），并在末尾注明该条目链接缺失：\n${links}`
           : '\n\n注意：本次未能从页面提取到任何真实链接。如果任务要求附带链接，如实说明无法获取链接，绝对不要编造网址，也不要声称链接会由系统附上。';
-        return `用户要求在网页上完成：「${prompt}」。${limitNote}请基于当前页面的实际内容和已完成的工作，用简洁中文汇总用户想要的结果本身（例如搜索到的主要信息/条目，逐条列出），不要描述执行了哪些操作，800 字以内；如果还没有收集到任何内容，就直接说"暂无有效结果"。${linkBlock}`;
+        return `用户要求在网页上完成：「${prompt}」。${limitNote}请基于当前页面的实际内容和已完成的工作，用简洁中文汇总用户想要的结果本身（例如搜索到的主要信息/条目，逐条列出），不要描述执行了哪些操作；如果任务要求返回若干条结果（如前 N 条/列表），必须用 markdown 表格逐条列出（表头：| 序号 | 标题 | 来源 | 链接 |，一行一条结果），表格行数多没关系、不受字数限制，表格之外的说明文字 800 字以内；如果还没有收集到任何内容，就直接说"暂无有效结果"。${linkBlock}`;
       };
       // 确定性兜底：采集到的链接直接作为数据放进结果，不依赖模型自觉。
       const flattenLinks = () => {
@@ -353,9 +404,21 @@ export function installQiyuanBridge() {
       if (byteLen(finalOutcome) > 200 * 1024) {
         finalOutcome = { result: '任务已完成（结果超出对话容量，请回看过程视频）', ...uploadOutcome };
       }
+      // 面板终态：和对话页同一口径（取消/失败/完成 + 结果摘要）。
+      panelState = abort.signal.aborted ? 'cancelled'
+        : (finalOutcome && typeof finalOutcome === 'object' && 'error' in finalOutcome ? 'failed' : 'done');
+      panelResultText = String((finalOutcome as Record<string, unknown>).result ?? (finalOutcome as Record<string, unknown>).error ?? '').slice(0, 2000);
       postProgress(true); // flush the complete timeline before the terminal post
       await request('result', { outcome: finalOutcome, cancelled: abort.signal.aborted });
       } catch (error) {
+        // 面板变量都声明在 try 块内、catch 里不可见；如果面板已渲染过，直接
+        // 把标题翻成失败态即可。
+        try {
+          if (typeof document !== 'undefined') {
+            const head = document.querySelector('#qiyuan-live-progress > div:first-child') as HTMLElement | null;
+            if (head) { head.textContent = '✗ 任务失败'; head.style.color = '#c00'; }
+          }
+        } catch { /* ignore */ }
         // The chat page only learns the outcome from the backend; never let a
         // failure above (uploads, result post) leave the task unterminated.
         try { await request('result', { outcome: { error: error instanceof Error ? error.message : String(error) }, cancelled: reservation.abort.signal.aborted }); } catch { /* backend unreachable */ }
