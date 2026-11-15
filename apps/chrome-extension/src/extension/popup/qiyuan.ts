@@ -103,6 +103,9 @@ export function installQiyuanBridge() {
       // 渲染进面板 DOM，不看对话页也能跟踪任务。终态保留显示直到下个任务。
       let panelState: 'running' | 'done' | 'failed' | 'cancelled' = 'running';
       let panelResultText = '';
+      // 停止按钮的二次确认状态：第一次点击进入"再点一次确认"，5 秒不点自动还原。
+      let stopArmed = false;
+      let stopArmTimer: ReturnType<typeof setTimeout> | undefined;
       const renderPanel = () => {
         try {
           if (typeof document === 'undefined') return;
@@ -136,8 +139,11 @@ export function installQiyuanBridge() {
           root.style.cssText = 'position:fixed;inset:0;background:#fff;z-index:9999;overflow-y:auto;padding:16px;font:13px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;box-sizing:border-box';
           // 状态头 sticky 吸顶：面板自动滚到底部展示最新步骤时，完成/失败
           // 横幅仍然可见；终态再额外在时间线末尾放一条横幅，双保险。
+          const stopBtn = panelState === 'running'
+            ? `<button id="qiyuan-stop-btn" style="margin-left:12px;font-size:12px;padding:2px 12px;border:1px solid ${stopArmed ? '#c00' : '#ccc'};border-radius:6px;background:${stopArmed ? '#c00' : '#fff'};color:${stopArmed ? '#fff' : '#c00'};cursor:pointer;vertical-align:2px">${stopArmed ? '再点一次确认停止' : '停止任务'}</button>`
+            : '';
           const headBlock = `<div style="position:sticky;top:-16px;background:#fff;padding:8px 0 6px;margin:-8px 0 6px;border-bottom:1px solid #eee;z-index:1">`
-            + `<div style="font-size:15px;font-weight:600;color:${color}">${headText}</div>`
+            + `<div style="font-size:15px;font-weight:600;color:${color}">${headText}${stopBtn}</div>`
             + (lastTip && panelState === 'running' ? `<div style="color:#666;font-size:12px;margin-top:2px">${esc(lastTip)}</div>` : '')
             + (panelResultText ? `<div style="color:#333;font-size:13px;margin-top:4px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:200px;overflow-y:auto">${esc(panelResultText)}</div>` : '')
             + `</div>`;
@@ -146,6 +152,25 @@ export function installQiyuanBridge() {
           root.innerHTML = headBlock
             + `<div style="border-left:2px solid #e5e7eb;padding-left:10px">${rows}</div>`
             + tailBanner;
+          // 停止按钮：第一次点击进入确认态（重渲染后由 stopArmed 保持文案），
+          // 确认态下再点才真正 abort；确认后任务走取消终态并照常回传 /result。
+          const stopEl = root.querySelector('#qiyuan-stop-btn') as HTMLButtonElement | null;
+          if (stopEl) {
+            stopEl.onclick = () => {
+              if (!stopArmed) {
+                stopArmed = true;
+                clearTimeout(stopArmTimer);
+                stopArmTimer = setTimeout(() => { stopArmed = false; renderPanel(); }, 5000);
+                renderPanel();
+                return;
+              }
+              clearTimeout(stopArmTimer);
+              stopArmed = false;
+              pushTip('用户请求停止，正在收尾…');
+              try { abort.abort(); } catch { /* 已停止 */ }
+              renderPanel();
+            };
+          }
           root.scrollTop = root.scrollHeight;
         } catch { /* 面板渲染失败不影响任务 */ }
       };
@@ -287,7 +312,7 @@ export function installQiyuanBridge() {
       let outcome: unknown;
       // 模型只看截图看不到 href，「带链接」类需求会逼它诚实认输。提前声明：
       // 链接由系统自动提取，它只需浏览阅读，不用记录网址。
-      const actPrompt = `${prompt}\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。注意：任务从一个空白新标签页开始——需要浏览网页时请直接用「浏览」动作打开合适的网站（如 Google/Bing 搜索、任务或对话上下文里提到的站点），主动搜索任务主题；当前页空白不是放弃的理由，禁止因为页面空白就结束任务。）`;
+      const actPrompt = `${prompt}\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。注意：任务从一个空白新标签页开始——需要浏览网页时请直接用「浏览」动作打开合适的网站（如 Google/Bing 搜索、任务或对话上下文里提到的站点），主动搜索任务主题；当前页空白不是放弃的理由，禁止因为页面空白就结束任务。效率要求：搜索结果每页约 10 条，浏览 5–8 页通常就足够；标题和摘要级别的候选即可计入结果，不需要逐个打开帖子核实正文，也不要因为"摘要不够详细""可能是转述"这类理由排除候选——判断是否与此前结果重复只看标题或链接是否相同。收集到任务要求数量的候选后必须立即停止浏览；连续两页没有新的相关结果时也必须停止，然后正常结束任务。）`;
       // 汇总提示：把执行中采集到的真实链接列表交给模型，只允许用这些链接。
       const buildSummaryPrompt = (limitNote: string) => {
         const links = linkCorpusText();
@@ -323,6 +348,10 @@ export function installQiyuanBridge() {
         outcome = await sdk.executeAction('aiAct', { type: 'aiAct', prompt: actPrompt }, { requestId: message.taskId, abortSignal: actSignal });
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
+        if (abort.signal.aborted) {
+          // 用户点了停止：跳过半路汇总，直接终态，别再用 aborted 信号空转。
+          outcome = { result: '任务已被用户停止。', partial: true };
+        } else {
         // 任何 aiAct 失败（超步数、动作失败、模型放弃等）都不直接把英文报错
         // 糊给用户：先采集一次当前页链接，再基于已完成的工作汇总部分结果。
         pushTip(/planning cycle limit|replanningCycleLimit/i.test(errorMessage) ? '已达步数上限，正在汇总已完成部分…' : '任务中途受挫，正在汇总已完成部分…');
@@ -333,6 +362,7 @@ export function installQiyuanBridge() {
           partialSummary = typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : '');
         } catch { /* 汇总失败时给出兜底文案 */ }
         outcome = { result: partialSummary.trim() || `任务未能完成：${errorMessage}`, partial: true };
+        }
       }
       // aiAct 只描述"做了什么动作"；用户要的是页面上的实际内容。
       // 任务成功后追加一次 aiAsk，基于当前页面总结与指令相关的内容。
@@ -357,7 +387,7 @@ export function installQiyuanBridge() {
       let videoAvailable = false;
       let videoError: string | undefined;
       const agent = reservation.agent;
-      if (agent) {
+      if (agent && !abort.signal.aborted) {
         try {
           pushTip('动作已完成，正在本地生成回放视频…');
           // The playground adapter finalizes the agent report after execution,
