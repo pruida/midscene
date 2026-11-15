@@ -56,7 +56,7 @@ export function installQiyuanBridge() {
       // would leave the chat page stuck forever. From here on the page
       // tracks the task by polling the backend, so the final state must
       // always reach /result — even when the steps below fail.
-      respond({ ok: true, taskId: message.taskId, started: true });
+      respond({ ok: true, taskId: message.taskId, started: true, version: chrome.runtime.getManifest().version });
       const abort = reservation.abort;
       const url = `${SITE}/api/browser-plugin/tasks/${message.taskId}`;
       const request = async (path: string, data: unknown, signal?: AbortSignal) => {

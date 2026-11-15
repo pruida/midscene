@@ -9,10 +9,11 @@ import archiver from 'archiver';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Read package.json
+// Version source of truth is the extension manifest itself (the core
+// package version belongs to the library, not to the packaged extension).
 const packageJsonPath = path.resolve(
   __dirname,
-  '../../../packages/core/package.json',
+  '../static/manifest.json',
 );
 const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 
