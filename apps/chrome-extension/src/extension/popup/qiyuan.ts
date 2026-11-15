@@ -60,7 +60,7 @@ export function installQiyuanBridge() {
       // action_done with durationMs). We keep a Midscene-report-like step
       // timeline and post it (throttled) with the tip so the chat page can
       // render plans and per-step durations in real time.
-      interface ProgressStep { kind: string; text: string; status: 'running' | 'done' | 'failed'; durationMs?: number }
+      interface ProgressStep { kind: string; text: string; status: 'running' | 'done' | 'failed'; durationMs?: number; ts: number }
       const steps: ProgressStep[] = [];
       let lastTip = '';
       let lastPostAt = 0;
@@ -69,7 +69,7 @@ export function installQiyuanBridge() {
         const now = Date.now();
         // Send the tail: long tasks only need recent steps for live display.
         const tail = steps.slice(-30).map(s => ({
-          k: s.kind.slice(0, 40), t: s.text.slice(0, 160), s: s.status,
+          k: s.kind.slice(0, 40), t: s.text.slice(0, 160), s: s.status, ts: s.ts,
           ...(s.durationMs != null ? { d: Math.round(s.durationMs) } : {}),
         }));
         const sig = `${lastTip}|${tail.length}|${tail.map(s => s.s + String(s.d ?? '')).join(',')}`;
@@ -84,6 +84,16 @@ export function installQiyuanBridge() {
         postProgress();
       };
       const lastRunning = (pred: (s: ProgressStep) => boolean) => { for (let i = steps.length - 1; i >= 0; i--) { if (steps[i].status === 'running' && pred(steps[i])) return steps[i]; } return undefined; };
+      // 时间线里的动作名用中文展示（模型输出的是英文动作名）。
+      const KIND_LABELS: Record<string, string> = {
+        Plan: '规划', Navigate: '浏览', Scroll: '滚动', Sleep: '等待',
+        Tap: '点击', DoubleClick: '双击', RightClick: '右键点击', MiddleClick: '中键点击',
+        Hover: '悬停', Input: '输入', ClearInput: '清空输入', KeyboardPress: '按键',
+        CursorMove: '移动光标', DragAndDrop: '拖拽', LongPress: '长按', Swipe: '滑动',
+        Pinch: '捏合', Reload: '刷新', GoBack: '后退', GoForward: '前进',
+        StopLoading: '停止加载', Finished: '完成', Error: '错误',
+      };
+      const kindLabel = (name: string) => KIND_LABELS[name] || name;
       const page = new ChromeExtensionProxyPage(true);
       await page.setActiveTabId(tab.id, { activate: false });
       const sdk = new PlaygroundSDK({ type: 'local-execution', agentFactory: () => {
@@ -112,9 +122,9 @@ export function installQiyuanBridge() {
             const d = event.data || {};
             if (event.phase === 'plan_thinking') {
               planThinkingAt = Date.now();
-              steps.push({ kind: 'Plan', text: `第 ${d.planIndex ?? '?'} 轮思考中…`, status: 'running' });
+              steps.push({ kind: kindLabel('Plan'), text: `第 ${d.planIndex ?? '?'} 轮思考中…`, status: 'running', ts: Date.now() });
             } else if (event.phase === 'plan_planned') {
-              const s = lastRunning(x => x.kind === 'Plan');
+              const s = lastRunning(x => x.kind === kindLabel('Plan'));
               if (s) {
                 s.status = 'done';
                 const thought = String(d.thought || d.log || '').replace(/\s+/g, ' ').trim();
@@ -124,9 +134,9 @@ export function installQiyuanBridge() {
             } else if (event.phase === 'action_running') {
               const name = String(d.action?.name || 'Action');
               const target = String(d.action?.target ?? (d.action?.param != null ? JSON.stringify(d.action.param) : '')).replace(/\s+/g, ' ').trim();
-              steps.push({ kind: name, text: target.slice(0, 160), status: 'running' });
+              steps.push({ kind: kindLabel(name), text: target.slice(0, 160), status: 'running', ts: Date.now() });
             } else if (event.phase === 'action_done' || event.phase === 'action_failed') {
-              const s = lastRunning(x => x.kind !== 'Plan');
+              const s = lastRunning(x => x.kind !== kindLabel('Plan'));
               if (s) {
                 s.status = event.phase === 'action_done' ? 'done' : 'failed';
                 if (typeof d.durationMs === 'number') s.durationMs = d.durationMs;
@@ -222,7 +232,7 @@ export function installQiyuanBridge() {
       // Ship the full step timeline (bounded) with the result so the final
       // conversation message can show every plan and its duration.
       const finalSteps = steps.slice(-60).map(s => ({
-        k: s.kind.slice(0, 40), t: s.text.slice(0, 200), s: s.status,
+        k: s.kind.slice(0, 40), t: s.text.slice(0, 200), s: s.status, ts: s.ts,
         ...(s.durationMs != null ? { d: Math.round(s.durationMs) } : {}),
       }));
       const uploadOutcome = { videoAvailable, ...(videoError ? { videoError } : {}), steps: finalSteps, totalSteps: steps.length };

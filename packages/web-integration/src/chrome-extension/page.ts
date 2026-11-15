@@ -311,6 +311,23 @@ export default class ChromeExtensionProxyPage implements AbstractInterface {
     });
   }
 
+  /**
+   * Fire-and-forget CDP for the purely cosmetic pointer overlay: short timeout,
+   * no retry, errors swallowed. A busy renderer must never stall real actions
+   * (screenshots/wheel) behind a visual flourish.
+   */
+  private async sendCosmeticCommand(expression: string) {
+    try {
+      const tabId = await this.getTabIdOrConnectToCurrentTab();
+      await Promise.race([
+        chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', { expression }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('cosmetic eval timeout')), 3000)),
+      ]);
+    } catch (error) {
+      console.warn('Cosmetic CDP command skipped:', error);
+    }
+  }
+
   private async showMousePointer(x: number, y: number) {
     if (!this.waterFlowAnimationEnabled) return;
 
@@ -324,19 +341,15 @@ export default class ChromeExtensionProxyPage implements AbstractInterface {
       }
     })()`;
 
-    await this.sendCommandToDebugger('Runtime.evaluate', {
-      expression: `${pointerScript}`,
-    });
+    await this.sendCosmeticCommand(pointerScript);
   }
 
   private async hideMousePointer() {
-    await this.sendCommandToDebugger('Runtime.evaluate', {
-      expression: `(() => {
-        if(typeof window.midsceneWaterFlowAnimation !== 'undefined') {
-          window.midsceneWaterFlowAnimation.hideMousePointer();
-        }
-      })()`,
-    });
+    await this.sendCosmeticCommand(`(() => {
+      if(typeof window.midsceneWaterFlowAnimation !== 'undefined') {
+        window.midsceneWaterFlowAnimation.hideMousePointer();
+      }
+    })()`);
   }
 
   /**
@@ -429,6 +442,14 @@ export default class ChromeExtensionProxyPage implements AbstractInterface {
   private sendCommandWithTimeout(tabId: number, command: string, params: unknown): Promise<any> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
+        // Input events are queued by the browser even when the renderer main
+        // thread is busy — the click/wheel DID land (observed on wedged
+        // infinite-scroll pages), so a missing ack must not fail the action.
+        if (command.startsWith('Input.')) {
+          console.warn(`CDP command "${command}" ack timed out; treating queued input as delivered`);
+          resolve(undefined);
+          return;
+        }
         reject(
           new Error(
             `CDP command "${command}" timed out after ${ChromeExtensionProxyPage.CDP_COMMAND_TIMEOUT_MS}ms (page renderer busy)`,
@@ -479,10 +500,13 @@ export default class ChromeExtensionProxyPage implements AbstractInterface {
         errorMsg.includes('No target with given id');
 
       // A busy renderer stalls a command until our own timeout fires. Reattach
-      // and retry once rather than hanging for minutes on one wedged evaluate.
+      // and retry ONCE rather than hanging for minutes on one wedged evaluate —
+      // a jammed main thread does not recover within seconds, so extra retries
+      // are pure dead time (observed: 3x20s before the action finally failed).
       const isTimeoutError = errorMsg.includes('timed out after');
+      const retryLimit = isTimeoutError ? 1 : MAX_RETRIES;
 
-      if ((isDetachError || isTimeoutError) && retryCount < MAX_RETRIES) {
+      if ((isDetachError || isTimeoutError) && retryCount < retryLimit) {
         console.log(
           `Debugger not attached for command "${command}", attempting to attach (retry ${retryCount + 1}/${MAX_RETRIES})`,
         );
