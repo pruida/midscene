@@ -90,11 +90,22 @@ export function installQiyuanBridge() {
         agent.addDumpUpdateListener((_dumpStr: string, execDump: any) => {
           try {
             const executions = execDump?.executions || [];
-            const latest = executions[executions.length - 1];
-            const tasks = latest?.tasks || [];
-            const current = [...tasks].reverse().find((t: any) => t?.status === 'running') || tasks[tasks.length - 1];
-            const what = current?.thought || current?.name || '';
-            pushTip(`执行中 · 第 ${executions.length} 轮${what ? ' · ' + what : ''}`);
+            // 规划轮都在同一个 execution 里，"轮数"要数 tasks 而不是
+            // executions；全部 execution 的 task 合计才是真实步数。
+            let steps = 0;
+            let current: any;
+            for (const ex of executions) {
+              const ts = ex?.tasks || [];
+              steps += ts.length;
+              for (const t of ts) if (t?.status === 'running') current = t;
+            }
+            if (!current) {
+              const latest = executions[executions.length - 1];
+              const ts = latest?.tasks || [];
+              current = ts[ts.length - 1];
+            }
+            const what = (current?.thought || current?.name || '').replace(/\s+/g, ' ').trim();
+            pushTip(`执行中 · 已进行 ${steps} 步${what ? ' · ' + what : ''}`);
           } catch { /* tip 推导失败不影响执行 */ }
         });
         return agent;
