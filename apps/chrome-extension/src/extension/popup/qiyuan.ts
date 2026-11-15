@@ -35,9 +35,22 @@ export function installQiyuanBridge() {
       // tabs are never navigated, and the model drives this tab end to end.
       // The explicit 「使用浏览器插件」 prefix is the user's consent, so no
       // extra confirm dialog is needed.
-      const tab = await chrome.tabs.create({ url: 'about:blank', active: true });
+      // 起始页用 Google 而不是空白页：追问类任务（"再找50篇"）没有点名网站时，
+      // 模型面对空白页容易直接放弃；给一个可用的搜索页作为起点。
+      const tab = await chrome.tabs.create({ url: 'https://www.google.com/', active: true });
       reservation.abort.signal.throwIfAborted();
       if (!tab?.id) throw new Error('无法新建任务标签页');
+      // 等起始页加载完再接管：页面还在 loading 时 debugger 截图会报
+      // "Unable to capture screenshot"，首个动作直接失败。
+      try {
+        const tabId = tab.id;
+        const t0 = Date.now();
+        while (Date.now() - t0 < 10000) {
+          const t = await chrome.tabs.get(tabId).catch(() => null);
+          if (!t || t.status === 'complete') break;
+          await new Promise(r => setTimeout(r, 200));
+        }
+      } catch { /* 页面消失或查询失败，继续由后续步骤报错 */ }
       // Acknowledge immediately: the task may run for minutes, and an MV3
       // service worker waiting on this respond can be killed mid-wait, which
       // would leave the chat page stuck forever. From here on the page
@@ -274,7 +287,7 @@ export function installQiyuanBridge() {
       let outcome: unknown;
       // 模型只看截图看不到 href，「带链接」类需求会逼它诚实认输。提前声明：
       // 链接由系统自动提取，它只需浏览阅读，不用记录网址。
-      const actPrompt = `${prompt}\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。）`;
+      const actPrompt = `${prompt}\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。注意：任务从一个空白新标签页开始——需要浏览网页时请直接用「浏览」动作打开合适的网站（如 Google/Bing 搜索、任务或对话上下文里提到的站点），主动搜索任务主题；当前页空白不是放弃的理由，禁止因为页面空白就结束任务。）`;
       // 汇总提示：把执行中采集到的真实链接列表交给模型，只允许用这些链接。
       const buildSummaryPrompt = (limitNote: string) => {
         const links = linkCorpusText();
