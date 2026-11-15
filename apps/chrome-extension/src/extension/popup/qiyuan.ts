@@ -104,7 +104,11 @@ export function installQiyuanBridge() {
       pushTip('任务已下发，正在启动…');
       let outcome: unknown;
       try {
-        outcome = await sdk.executeAction('aiAct', { type: 'aiAct', prompt }, { requestId: message.taskId, abortSignal: abort.signal });
+        // Hard cap: if the agent loop stalls (dead page, wedged navigation),
+        // abort so /result is still posted while this context is alive. The
+        // backend watchdog (15 min silence) is the fallback if WE die instead.
+        const actSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(30 * 60_000)]);
+        outcome = await sdk.executeAction('aiAct', { type: 'aiAct', prompt }, { requestId: message.taskId, abortSignal: actSignal });
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         if (/planning cycle limit|replanningCycleLimit/i.test(errorMessage)) {
