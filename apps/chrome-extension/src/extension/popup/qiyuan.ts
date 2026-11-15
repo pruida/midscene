@@ -96,6 +96,53 @@ export function installQiyuanBridge() {
       const kindLabel = (name: string) => KIND_LABELS[name] || name;
       const page = new ChromeExtensionProxyPage(true);
       await page.setActiveTabId(tab.id, { activate: false });
+      // 链接语料库：Midscene 是纯视觉管线，模型只看截图、看不到 href。
+      // 「每条带原文链接」类任务因此必然失败（模型只能诚实拒绝）。这里在
+      // 执行过程中直接从 DOM 提取真实链接（锚文本+href+所在页面），汇总时
+      // 交给模型配对，杜绝编造网址。
+      const linkCorpus: Array<{ page: string; title: string; links: Array<{ t: string; h: string }> }> = [];
+      const seenHrefs = new Set<string>();
+      let lastHarvestAt = 0;
+      const harvestLinks = async () => {
+        try {
+          const res: any = await page.evaluateJavaScript(`(() => {
+            const out = [];
+            for (const a of document.querySelectorAll('a[href]')) {
+              const t = (a.innerText || a.textContent || '').replace(/\\s+/g, ' ').trim();
+              if (t.length < 6) continue;
+              const h = a.href;
+              if (!/^https?:/.test(h) || h.includes('google.com/search') || h.includes('#')) continue;
+              out.push({ t: t.slice(0, 120), h: h.slice(0, 300) });
+              if (out.length >= 150) break;
+            }
+            return { url: location.href, title: (document.title || '').slice(0, 120), links: out };
+          })()`);
+          const val = res?.result?.value ?? res?.value ?? res;
+          if (!val || !Array.isArray(val.links) || typeof val.url !== 'string') return;
+          const fresh = val.links.filter((l: any) => l && typeof l.t === 'string' && typeof l.h === 'string' && !seenHrefs.has(l.h));
+          if (!fresh.length) return;
+          for (const l of fresh) seenHrefs.add(l.h);
+          linkCorpus.push({ page: String(val.url).slice(0, 200), title: String(val.title || ''), links: fresh });
+          // 总量护栏：最多留最近 8 页 / 400 条
+          while (linkCorpus.length > 8) linkCorpus.shift();
+          let total = linkCorpus.reduce((n, p) => n + p.links.length, 0);
+          for (let i = 0; total > 400 && i < linkCorpus.length - 1; i++) {
+            const drop = Math.min(linkCorpus[i].links.length, total - 400);
+            linkCorpus[i].links.splice(0, drop);
+            total -= drop;
+          }
+        } catch { /* 页面忙/导航中，跳过本次采集 */ }
+      };
+      const linkCorpusText = () => {
+        const lines: string[] = [];
+        for (const p of linkCorpus) {
+          if (!p.links.length) continue;
+          lines.push(`【页面】${p.title}（${p.page}）`);
+          for (const l of p.links) lines.push(`- ${l.t} → ${l.h}`);
+        }
+        const text = lines.join('\n');
+        return text.length > 20000 ? text.slice(-20000) : text;
+      };
       const sdk = new PlaygroundSDK({ type: 'local-execution', agentFactory: () => {
         const agent = new ChromeExtensionProxyPageAgent(page, {
         // Multi-step collection tasks (e.g. "汇总50条结果") legitimately need
@@ -141,6 +188,11 @@ export function installQiyuanBridge() {
                 s.status = event.phase === 'action_done' ? 'done' : 'failed';
                 if (typeof d.durationMs === 'number') s.durationMs = d.durationMs;
               }
+              // 每个动作做完顺手采集当前页真实链接（节流到 5s 一次）
+              if (event.phase === 'action_done' && Date.now() - lastHarvestAt > 5000) {
+                lastHarvestAt = Date.now();
+                void harvestLinks();
+              }
             } else if (event.phase === 'plan_failed') {
               const s = lastRunning(() => true);
               if (s) s.status = 'failed';
@@ -158,33 +210,43 @@ export function installQiyuanBridge() {
       abort.signal.throwIfAborted();
       pushTip('任务已下发，正在启动…');
       let outcome: unknown;
+      // 模型只看截图看不到 href，「带链接」类需求会逼它诚实认输。提前声明：
+      // 链接由系统自动提取，它只需浏览阅读，不用记录网址。
+      const actPrompt = `${prompt}\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。）`;
+      // 汇总提示：把执行中采集到的真实链接列表交给模型，只允许用这些链接。
+      const buildSummaryPrompt = (limitNote: string) => {
+        const links = linkCorpusText();
+        const linkBlock = links
+          ? `\n\n以下是执行过程中从页面 DOM 提取的真实链接列表（锚文本 → 网址）。如果任务要求附带链接，你必须只使用这个列表里的网址，逐条配对，禁止编造或猜测任何不在列表中的链接；列表里没有合适链接的条目就不要附链接：\n${links}`
+          : '';
+        return `用户要求在网页上完成：「${prompt}」。${limitNote}请基于当前页面的实际内容和已完成的工作，用简洁中文汇总用户想要的结果本身（例如搜索到的主要信息/条目，逐条列出），不要描述执行了哪些操作，500 字以内；如果还没有收集到任何内容，就直接说"暂无有效结果"。${linkBlock}`;
+      };
       try {
         // Hard cap: if the agent loop stalls (dead page, wedged navigation),
         // abort so /result is still posted while this context is alive. The
         // backend watchdog (15 min silence) is the fallback if WE die instead.
         const actSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(30 * 60_000)]);
-        outcome = await sdk.executeAction('aiAct', { type: 'aiAct', prompt }, { requestId: message.taskId, abortSignal: actSignal });
+        outcome = await sdk.executeAction('aiAct', { type: 'aiAct', prompt: actPrompt }, { requestId: message.taskId, abortSignal: actSignal });
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
-        if (/planning cycle limit|replanningCycleLimit/i.test(errorMessage)) {
-          // 超过规划轮次上限：不要把英文报错糊给用户，基于已完成的工作汇总部分结果。
-          pushTip('已达步数上限，正在汇总已完成部分…');
-          let partialSummary = '';
-          try {
-            const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: `用户要求在网页上完成：「${prompt}」。任务因步数较多被提前结束。请基于当前页面的实际内容和目前已完成的工作，用简洁中文汇总已经收集到的结果/进展（300 字以内）；如果还没有收集到任何内容，就直接说"暂无有效结果"。` }, { requestId: `${message.taskId}-partial`, abortSignal: abort.signal });
-            partialSummary = typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : '');
-          } catch { /* 汇总失败时给出兜底文案 */ }
-          outcome = { result: partialSummary.trim() || '任务因步数较多提前结束，未能收集到有效结果。', partial: true };
-        } else {
-          outcome = { error: errorMessage };
-        }
+        // 任何 aiAct 失败（超步数、动作失败、模型放弃等）都不直接把英文报错
+        // 糊给用户：先采集一次当前页链接，再基于已完成的工作汇总部分结果。
+        pushTip(/planning cycle limit|replanningCycleLimit/i.test(errorMessage) ? '已达步数上限，正在汇总已完成部分…' : '任务中途受挫，正在汇总已完成部分…');
+        await harvestLinks();
+        let partialSummary = '';
+        try {
+          const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: buildSummaryPrompt('任务因故被提前结束。') }, { requestId: `${message.taskId}-partial`, abortSignal: abort.signal });
+          partialSummary = typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : '');
+        } catch { /* 汇总失败时给出兜底文案 */ }
+        outcome = { result: partialSummary.trim() || `任务未能完成：${errorMessage}`, partial: true };
       }
       // aiAct 只描述"做了什么动作"；用户要的是页面上的实际内容。
       // 任务成功后追加一次 aiAsk，基于当前页面总结与指令相关的内容。
       if (!(outcome && typeof outcome === 'object' && ('error' in (outcome as Record<string, unknown>) || 'partial' in (outcome as Record<string, unknown>)))) {
         pushTip('正在汇总结果…');
+        await harvestLinks(); // 汇总前再采集一次，确保最后一页的链接也在语料库里
         try {
-          const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: `用户刚才要求在网页上完成：「${prompt}」。请基于当前页面的实际内容，用简洁中文汇总用户想要的结果本身（例如搜索到的主要信息/条目），不要描述执行了哪些操作，300 字以内。` }, { requestId: `${message.taskId}-ask`, abortSignal: abort.signal });
+          const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: buildSummaryPrompt('') }, { requestId: `${message.taskId}-ask`, abortSignal: abort.signal });
           const answer = typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : '');
           if (answer.trim()) {
             outcome = outcome && typeof outcome === 'object' && !Array.isArray(outcome)
