@@ -220,9 +220,20 @@ export function installQiyuanBridge() {
       const buildSummaryPrompt = (limitNote: string) => {
         const links = linkCorpusText();
         const linkBlock = links
-          ? `\n\n以下是执行过程中从页面 DOM 提取的真实链接列表（锚文本 → 网址）。如果任务要求附带链接，你必须只使用这个列表里的网址，逐条配对，禁止编造或猜测任何不在列表中的链接；列表里没有合适链接的条目就不要附链接：\n${links}`
-          : '';
+          ? `\n\n以下是执行过程中从页面 DOM 提取的真实链接列表（锚文本 → 网址）。如果任务要求附带链接，你必须只使用这个列表里的网址，逐条以 markdown 链接格式附在每条结果后面，禁止编造或猜测任何不在列表中的链接；列表里没有合适链接的条目就不要附链接：\n${links}`
+          : '\n\n注意：本次未能从页面提取到任何真实链接。如果任务要求附带链接，如实说明无法获取链接，绝对不要编造网址，也不要声称链接会由系统附上。';
         return `用户要求在网页上完成：「${prompt}」。${limitNote}请基于当前页面的实际内容和已完成的工作，用简洁中文汇总用户想要的结果本身（例如搜索到的主要信息/条目，逐条列出），不要描述执行了哪些操作，500 字以内；如果还没有收集到任何内容，就直接说"暂无有效结果"。${linkBlock}`;
+      };
+      // 确定性兜底：采集到的链接直接作为数据放进结果，不依赖模型自觉。
+      const flattenLinks = () => {
+        const out: Array<{ t: string; h: string; page: string }> = [];
+        for (const p of linkCorpus) {
+          for (const l of p.links) {
+            out.push({ t: l.t, h: l.h, page: p.title || p.page });
+            if (out.length >= 100) return out;
+          }
+        }
+        return out;
       };
       try {
         // Hard cap: if the agent loop stalls (dead page, wedged navigation),
@@ -248,6 +259,7 @@ export function installQiyuanBridge() {
       if (!(outcome && typeof outcome === 'object' && ('error' in (outcome as Record<string, unknown>) || 'partial' in (outcome as Record<string, unknown>)))) {
         pushTip('正在汇总结果…');
         await harvestLinks(); // 汇总前再采集一次，确保最后一页的链接也在语料库里
+        pushTip(seenHrefs.size ? `已采集到 ${seenHrefs.size} 条页面真实链接，正在汇总…` : '未能从页面提取到链接，正在汇总…');
         try {
           const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: buildSummaryPrompt('') }, { requestId: `${message.taskId}-ask`, abortSignal: abort.signal });
           const answer = typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : '');
@@ -300,7 +312,8 @@ export function installQiyuanBridge() {
         k: s.kind.slice(0, 40), t: s.text.slice(0, 200), s: s.status, ts: s.ts,
         ...(s.durationMs != null ? { d: Math.round(s.durationMs) } : {}),
       }));
-      const uploadOutcome = { videoAvailable, ...(videoError ? { videoError } : {}), steps: finalSteps, totalSteps: steps.length };
+      const harvestedLinks = flattenLinks();
+      const uploadOutcome = { videoAvailable, ...(videoError ? { videoError } : {}), ...(harvestedLinks.length ? { links: harvestedLinks } : {}), steps: finalSteps, totalSteps: steps.length };
       // The action outcome carries heavy fields (dump with base64 screenshots,
       // report HTML, logs) — far over the backend's 256KB result cap, and
       // unreadable in chat anyway. Summarize: drop known-heavy keys, drop
