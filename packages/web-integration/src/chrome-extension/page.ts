@@ -579,6 +579,9 @@ export default class ChromeExtensionProxyPage implements AbstractInterface {
     return this.sendCommandToDebugger('Runtime.evaluate', {
       expression: script,
       awaitPromise: true,
+      // Without this CDP returns an object reference instead of the serialized
+      // value, and callers reading result.value silently get undefined.
+      returnByValue: true,
     });
   }
 
