@@ -1,8 +1,13 @@
 {
-  "name": "Midscene.js",
+  "name": "启源浏览器助手",
   "description": "Open-source SDK for automating web pages using natural language through AI.",
   "version": "1.126",
   "manifest_version": 3,
+  "externally_connectable": {
+    "matches": [
+      "https://ai.qykaiwu.cn/*"
+    ]
+  },
   "permissions": [
     "activeTab",
     "webRequest",
@@ -35,12 +40,13 @@
   ],
   "action": {
     "default_icon": "icon128.png",
-    "default_title": "Midscene.js"
+    "default_title": "启源浏览器助手"
   },
   "side_panel": {
     "default_path": "./index.html"
   },
   "icons": {
     "128": "icon128.png"
-  }
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA8hdZW8ERrlDNAnVIDlrjJUyzLtDvy90OcsXFp+iciAScyFSMn1HRv7mqB7gh+NLEH18SF3SnRVhE+OWkDEjrv64CJPzf+TQ/vS4LIWt745LArfrgUTL2zvEewlfHXNahoLNk6y2bIRk3ghEUR3E/BxNUd/xhrh9iBFne9spSHFSScJ4giqWAuuEmUegXYqPEhXrJgAYb1T/LRs7lXOg87EoiuYun/L+MNh9Uokj4ngZqnas9QSieZew5vJRAr+PAuqqLll/GOMRz1bXzTLI/QWio1spcJ02n2bGFdvP9o/EHJhc6ws9yeOrTyBf+uc1OO1g0qiEgHUyj0k4Y+bGgGQIDAQAB"
 }

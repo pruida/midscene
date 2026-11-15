@@ -50,6 +50,13 @@ export { ServiceModeControl } from './component/service-mode-control';
 export { ContextPreview } from './component/context-preview';
 export { PromptInput } from './component/prompt-input';
 export { Player } from './component/player';
+export {
+  exportBrandedVideo,
+  exportBrandedVideoBlob,
+} from './component/player/scenes/export-branded-video';
+export type { ExportBrandedVideoOptions } from './component/player/scenes/export-branded-video';
+export { calculateFrameMap } from './component/player/scenes/frame-calculator';
+export type { FrameMap } from './component/player/scenes/frame-calculator';
 export { Blackboard } from './component/blackboard';
 export { default as ScreenshotViewer } from './component/screenshot-viewer';
 export type { ScreenshotViewerMode } from './component/screenshot-viewer';

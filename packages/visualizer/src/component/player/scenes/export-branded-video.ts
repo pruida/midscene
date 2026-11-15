@@ -369,19 +369,47 @@ function drawSteps(
 
 // ── main export function ──
 
+export interface ExportBrandedVideoOptions {
+  autoZoom?: boolean;
+  /**
+   * Drive the render loop with setTimeout instead of requestAnimationFrame.
+   * Required in contexts where rAF never fires (e.g. hidden extension
+   * pages). The recorded stream still advances in real time.
+   */
+  timerDriven?: boolean;
+  /**
+   * Cap the MediaRecorder bitrate (bits/second). Long tasks at the default
+   * bitrate easily exceed upload limits, so callers can trade quality for
+   * size (e.g. 1.5Mbps, then retry lower).
+   */
+  videoBitsPerSecond?: number;
+}
+
 export async function exportBrandedVideo(
   frameMap: FrameMap,
-  options?: {
-    autoZoom?: boolean;
-  },
+  options?: ExportBrandedVideoOptions,
   onProgress?: (pct: number) => void,
 ): Promise<void> {
+  const blob = await exportBrandedVideoBlob(frameMap, options, onProgress);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'midscene_replay.webm';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export async function exportBrandedVideoBlob(
+  frameMap: FrameMap,
+  options?: ExportBrandedVideoOptions,
+  onProgress?: (pct: number) => void,
+): Promise<Blob> {
   if (activeExport) {
     throw new Error('Video export is already in progress');
   }
   activeExport = true;
   try {
-    await runExportBrandedVideo(frameMap, options, onProgress);
+    return await runExportBrandedVideo(frameMap, options, onProgress);
   } finally {
     activeExport = false;
   }
@@ -389,13 +417,12 @@ export async function exportBrandedVideo(
 
 async function runExportBrandedVideo(
   frameMap: FrameMap,
-  options?: {
-    autoZoom?: boolean;
-  },
+  options?: ExportBrandedVideoOptions,
   onProgress?: (pct: number) => void,
-): Promise<void> {
+): Promise<Blob> {
   const { totalDurationInFrames: total, fps } = frameMap;
   const autoZoom = options?.autoZoom ?? true;
+  const timerDriven = options?.timerDriven ?? false;
 
   // 1. pre-load all images
   const imgSrcs = new Set<string>();
@@ -442,17 +469,30 @@ async function runExportBrandedVideo(
   canvas.height = H;
   const ctx = canvas.getContext('2d')!;
 
-  const stream = canvas.captureStream(fps);
-  const recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+  const stream = canvas.captureStream(timerDriven ? 0 : fps);
+  // In timer-driven (hidden-page) mode the compositor never paints, so
+  // captureStream(fps) would emit no frames; request each frame explicitly.
+  const manualCaptureTrack = timerDriven
+    ? (stream.getVideoTracks()[0] as unknown as {
+        requestFrame?: () => void;
+      } | undefined)
+    : undefined;
+  const recorder = new MediaRecorder(stream, {
+    mimeType: 'video/webm',
+    ...(options?.videoBitsPerSecond
+      ? { videoBitsPerSecond: options.videoBitsPerSecond }
+      : {}),
+  });
   const chunks: BlobPart[] = [];
   recorder.ondataavailable = (e) => {
     if (e.data.size > 0) chunks.push(e.data);
   };
 
   // 3. render loop
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<Blob>((resolve, reject) => {
     let stoppedByError: Error | null = null;
     let settled = false;
+    let requestedFrames = 0;
     let nextFrame = 0;
     let nextFrameDueAt = performance.now();
     let lastFrameAt = nextFrameDueAt;
@@ -493,6 +533,15 @@ async function runExportBrandedVideo(
       finishWithError(new Error('MediaRecorder error'));
     };
     recorder.onstop = () => {
+      const diagTrack = stream.getVideoTracks()[0];
+      const diag = {
+        chunks: chunks.length,
+        requestedFrames,
+        totalFrames: total,
+        trackState: diagTrack?.readyState,
+        hidden: document.hidden,
+        imgCacheSize: imgCache.size,
+      };
       cleanup();
       if (settled) return;
       settled = true;
@@ -505,19 +554,29 @@ async function runExportBrandedVideo(
         return;
       }
       const blob = new Blob(chunks, { type: 'video/webm' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'midscene_replay.webm';
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      resolve();
+      if (timerDriven && blob.size < 1000) {
+        reject(
+          new Error(
+            `Header-only video export: ${JSON.stringify({ blobSize: blob.size, ...diag })}`,
+          ),
+        );
+        return;
+      }
+      resolve(blob);
     };
 
-    document.addEventListener('visibilitychange', handleVisibilityChange);
+    if (!timerDriven) {
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
     recorder.start();
 
     const scheduleNextFrame = () => {
+      if (timerDriven) {
+        renderTimer = setTimeout(() => {
+          renderFrame(performance.now());
+        }, Math.max(0, nextFrameDueAt - performance.now()));
+        return;
+      }
       const delay = Math.max(0, nextFrameDueAt - performance.now());
       renderTimer = setTimeout(() => {
         requestAnimationFrame(renderFrame);
@@ -547,6 +606,14 @@ async function runExportBrandedVideo(
         spinnerImg,
         autoZoom,
       );
+      if (manualCaptureTrack?.requestFrame) {
+        // Force the canvas to rasterize pending draw calls; without this
+        // flush requestFrame() may capture stale/empty surfaces (observed
+        // with software rendering in extension pages).
+        ctx.getImageData(0, 0, 1, 1);
+        manualCaptureTrack.requestFrame();
+        requestedFrames += 1;
+      }
       onProgress?.((nextFrame + 1) / total);
 
       nextFrame += 1;
@@ -560,10 +627,15 @@ async function runExportBrandedVideo(
       }
     };
 
-    requestAnimationFrame((timestamp) => {
+    const kickOff = (timestamp: number) => {
       lastFrameAt = timestamp;
       nextFrameDueAt = timestamp;
       renderFrame(timestamp);
-    });
+    };
+    if (timerDriven) {
+      renderTimer = setTimeout(() => kickOff(performance.now()), 0);
+    } else {
+      requestAnimationFrame(kickOff);
+    }
   });
 }

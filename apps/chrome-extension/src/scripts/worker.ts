@@ -444,6 +444,33 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 });
 
+// Only the trusted first-party top-level page can ask the open side panel to run.
+chrome.runtime.onMessageExternal.addListener((request, sender, sendResponse) => {
+  let trusted = false;
+  try { trusted = new URL(sender.url || '').origin === 'https://ai.qykaiwu.cn'; } catch {}
+  if (!trusted || sender.frameId !== 0 || sender.tab?.id == null || !['run', 'cancel', 'replay'].includes(request?.type)) {
+    sendResponse({ ok: false, error: 'Untrusted sender' });
+    return false;
+  }
+  // Replay opens a local player page for a video stored in the extension's
+  // IndexedDB. Handled here so it works even when the side panel is closed.
+  if (request.type === 'replay') {
+    const taskId = String(request.taskId || '');
+    if (!/^[\w-]{1,128}$/.test(taskId)) {
+      sendResponse({ ok: false, error: 'Invalid task' });
+      return false;
+    }
+    chrome.tabs
+      .create({ url: chrome.runtime.getURL('replay.html') + '?task=' + encodeURIComponent(taskId) })
+      .then(() => sendResponse({ ok: true }), (e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    return true;
+  }
+  // The page cannot know its own tab id; record the chat tab here so the bridge
+  // can refuse to navigate it away and instead run on the user's active tab.
+  chrome.runtime.sendMessage({ ...request, targetTabId: sender.tab.id, channel: 'qiyuan-verified' }).then(sendResponse, () => sendResponse({ ok: false, error: 'Open the Qiyuan side panel first' }));
+  return true;
+});
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === SIWC_LOGIN_MESSAGE) {
     if (sender.id !== chrome.runtime.id || sender.tab) {

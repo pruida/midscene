@@ -416,7 +416,38 @@ export default class ChromeExtensionProxyPage implements AbstractInterface {
   /**
    * Send a command to the debugger with automatic attach and retry on detachment.
    * Uses lazy attach pattern - will automatically attach if not already attached.
+   *
+   * Every command is bounded by CDP_COMMAND_TIMEOUT_MS: on a page whose renderer
+   * main thread is jammed (infinite-scroll sites like reddit/x.com running heavy
+   * JS bursts after each wheel input), a Runtime.evaluate or Page.captureScreenshot
+   * can sit unanswered for minutes while the caller's own timeout loop never gets
+   * a chance to tick. Timing out here lets the retry/reattach logic run and keeps
+   * a single action (e.g. Scroll) in the seconds range instead of minutes.
    */
+  private static readonly CDP_COMMAND_TIMEOUT_MS = 20000;
+
+  private sendCommandWithTimeout(tabId: number, command: string, params: unknown): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(
+          new Error(
+            `CDP command "${command}" timed out after ${ChromeExtensionProxyPage.CDP_COMMAND_TIMEOUT_MS}ms (page renderer busy)`,
+          ),
+        );
+      }, ChromeExtensionProxyPage.CDP_COMMAND_TIMEOUT_MS);
+      chrome.debugger.sendCommand({ tabId }, command, params as any).then(
+        (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
   private async sendCommandToDebugger<ResponseType = any, RequestType = any>(
     command: string,
     params: RequestType,
@@ -427,10 +458,10 @@ export default class ChromeExtensionProxyPage implements AbstractInterface {
 
     try {
       // Try to send command directly first
-      const result = (await chrome.debugger.sendCommand(
-        { tabId },
+      const result = (await this.sendCommandWithTimeout(
+        tabId,
         command,
-        params as any,
+        params,
       )) as ResponseType;
 
       // Enable water flow animation after successful command (don't await)
@@ -447,7 +478,11 @@ export default class ChromeExtensionProxyPage implements AbstractInterface {
         errorMsg.includes('Cannot access a Target') ||
         errorMsg.includes('No target with given id');
 
-      if (isDetachError && retryCount < MAX_RETRIES) {
+      // A busy renderer stalls a command until our own timeout fires. Reattach
+      // and retry once rather than hanging for minutes on one wedged evaluate.
+      const isTimeoutError = errorMsg.includes('timed out after');
+
+      if ((isDetachError || isTimeoutError) && retryCount < MAX_RETRIES) {
         console.log(
           `Debugger not attached for command "${command}", attempting to attach (retry ${retryCount + 1}/${MAX_RETRIES})`,
         );

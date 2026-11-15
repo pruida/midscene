@@ -36,14 +36,15 @@ export default defineConfig({
           siwc: './src/extension/siwc/index.tsx',
           popup: './src/extension/popup/index.tsx',
           confirm: './src/extension/confirm/index.tsx',
+          replay: './src/extension/replay/index.tsx',
         },
       },
       html: {
         title: ({ entryName }) => {
           if (entryName === 'confirm') {
-            return 'Midscene Bridge';
+            return '启源浏览器助手 Bridge';
           }
-          return 'Midscene';
+          return '启源浏览器助手';
         },
       },
       output: {
