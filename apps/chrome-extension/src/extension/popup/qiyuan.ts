@@ -55,18 +55,35 @@ export function installQiyuanBridge() {
         return res.json();
       };
       try {
-      // Live progress: the SDK's onProgressUpdate is never fired by the local
-      // adapter, so derive tips from the agent's execution dump instead —
-      // each model round-trip updates it. Throttled + deduped posts.
+      // Live progress: the agent's aiAct progress bus carries structured
+      // per-step events (plan_thinking / plan_planned / action_running /
+      // action_done with durationMs). We keep a Midscene-report-like step
+      // timeline and post it (throttled) with the tip so the chat page can
+      // render plans and per-step durations in real time.
+      interface ProgressStep { kind: string; text: string; status: 'running' | 'done' | 'failed'; durationMs?: number }
+      const steps: ProgressStep[] = [];
       let lastTip = '';
-      let lastTipAt = 0;
+      let lastPostAt = 0;
+      let lastPostSig = '';
+      const postProgress = (force = false) => {
+        const now = Date.now();
+        // Send the tail: long tasks only need recent steps for live display.
+        const tail = steps.slice(-30).map(s => ({
+          k: s.kind.slice(0, 40), t: s.text.slice(0, 160), s: s.status,
+          ...(s.durationMs != null ? { d: Math.round(s.durationMs) } : {}),
+        }));
+        const sig = `${lastTip}|${tail.length}|${tail.map(s => s.s + String(s.d ?? '')).join(',')}`;
+        if (!force && (now - lastPostAt < 1500 || sig === lastPostSig)) return;
+        lastPostAt = now; lastPostSig = sig;
+        void request('progress', { tip: lastTip, steps: tail, totalSteps: steps.length }, abort.signal).catch(() => {});
+      };
       const pushTip = (tip: string) => {
         const clean = tip.replace(/\s+/g, ' ').trim().slice(0, 140);
-        const now = Date.now();
-        if (!clean || (clean === lastTip && now - lastTipAt < 60_000) || now - lastTipAt < 1500) return;
-        lastTip = clean; lastTipAt = now;
-        void request('progress', { tip: clean }, abort.signal).catch(() => {});
+        if (!clean) return;
+        lastTip = clean;
+        postProgress();
       };
+      const lastRunning = (pred: (s: ProgressStep) => boolean) => { for (let i = steps.length - 1; i >= 0; i--) { if (steps[i].status === 'running' && pred(steps[i])) return steps[i]; } return undefined; };
       const page = new ChromeExtensionProxyPage(true);
       await page.setActiveTabId(tab.id, { activate: false });
       const sdk = new PlaygroundSDK({ type: 'local-execution', agentFactory: () => {
@@ -87,26 +104,43 @@ export function installQiyuanBridge() {
         } }),
       });
         reservation.agent = agent;
-        agent.addDumpUpdateListener((_dumpStr: string, execDump: any) => {
+        // Structured per-step timeline straight from the aiAct progress bus.
+        let planThinkingAt = 0;
+        agent.addProgressListener((event: any) => {
           try {
-            const executions = execDump?.executions || [];
-            // 规划轮都在同一个 execution 里，"轮数"要数 tasks 而不是
-            // executions；全部 execution 的 task 合计才是真实步数。
-            let steps = 0;
-            let current: any;
-            for (const ex of executions) {
-              const ts = ex?.tasks || [];
-              steps += ts.length;
-              for (const t of ts) if (t?.status === 'running') current = t;
+            if (event?.scope !== 'aiAct') return;
+            const d = event.data || {};
+            if (event.phase === 'plan_thinking') {
+              planThinkingAt = Date.now();
+              steps.push({ kind: 'Plan', text: `第 ${d.planIndex ?? '?'} 轮思考中…`, status: 'running' });
+            } else if (event.phase === 'plan_planned') {
+              const s = lastRunning(x => x.kind === 'Plan');
+              if (s) {
+                s.status = 'done';
+                const thought = String(d.thought || d.log || '').replace(/\s+/g, ' ').trim();
+                if (thought) s.text = thought.slice(0, 160);
+                if (planThinkingAt) s.durationMs = Date.now() - planThinkingAt;
+              }
+            } else if (event.phase === 'action_running') {
+              const name = String(d.action?.name || 'Action');
+              const target = String(d.action?.target ?? (d.action?.param != null ? JSON.stringify(d.action.param) : '')).replace(/\s+/g, ' ').trim();
+              steps.push({ kind: name, text: target.slice(0, 160), status: 'running' });
+            } else if (event.phase === 'action_done' || event.phase === 'action_failed') {
+              const s = lastRunning(x => x.kind !== 'Plan');
+              if (s) {
+                s.status = event.phase === 'action_done' ? 'done' : 'failed';
+                if (typeof d.durationMs === 'number') s.durationMs = d.durationMs;
+              }
+            } else if (event.phase === 'plan_failed') {
+              const s = lastRunning(() => true);
+              if (s) s.status = 'failed';
+            } else {
+              return;
             }
-            if (!current) {
-              const latest = executions[executions.length - 1];
-              const ts = latest?.tasks || [];
-              current = ts[ts.length - 1];
-            }
-            const what = (current?.thought || current?.name || '').replace(/\s+/g, ' ').trim();
-            pushTip(`执行中 · 已进行 ${steps} 步${what ? ' · ' + what : ''}`);
-          } catch { /* tip 推导失败不影响执行 */ }
+            const runningNow = lastRunning(() => true);
+            lastTip = `执行中 · 已进行 ${steps.length} 步${runningNow ? ' · ' + runningNow.kind + (runningNow.text ? ' ' + runningNow.text : '') : ''}`;
+            postProgress();
+          } catch { /* 进度事件解析失败不影响执行 */ }
         });
         return agent;
       } });
@@ -158,6 +192,7 @@ export function installQiyuanBridge() {
       const agent = reservation.agent;
       if (agent) {
         try {
+          pushTip('动作已完成，正在本地生成回放视频…');
           // The playground adapter finalizes the agent report after execution,
           // which releases dump memory; the action result carries its own dump.
           const resultDump = outcome && typeof outcome === 'object' && Array.isArray((outcome as { dump?: { executions?: unknown } }).dump?.executions)
@@ -184,7 +219,13 @@ export function installQiyuanBridge() {
           videoError = error instanceof Error ? error.message : String(error);
         }
       }
-      const uploadOutcome = { videoAvailable, ...(videoError ? { videoError } : {}) };
+      // Ship the full step timeline (bounded) with the result so the final
+      // conversation message can show every plan and its duration.
+      const finalSteps = steps.slice(-60).map(s => ({
+        k: s.kind.slice(0, 40), t: s.text.slice(0, 200), s: s.status,
+        ...(s.durationMs != null ? { d: Math.round(s.durationMs) } : {}),
+      }));
+      const uploadOutcome = { videoAvailable, ...(videoError ? { videoError } : {}), steps: finalSteps, totalSteps: steps.length };
       // The action outcome carries heavy fields (dump with base64 screenshots,
       // report HTML, logs) — far over the backend's 256KB result cap, and
       // unreadable in chat anyway. Summarize: drop known-heavy keys, drop
@@ -224,6 +265,7 @@ export function installQiyuanBridge() {
       if (byteLen(finalOutcome) > 200 * 1024) {
         finalOutcome = { result: '任务已完成（结果超出对话容量，请回看过程视频）', ...uploadOutcome };
       }
+      postProgress(true); // flush the complete timeline before the terminal post
       await request('result', { outcome: finalOutcome, cancelled: abort.signal.aborted });
       } catch (error) {
         // The chat page only learns the outcome from the backend; never let a
