@@ -118,7 +118,10 @@ export function installQiyuanBridge() {
             return { url: location.href, title: (document.title || '').slice(0, 120), links: out };
           })()`);
           const val = res?.result?.value ?? res?.value ?? res;
-          if (!val || !Array.isArray(val.links) || typeof val.url !== 'string') return;
+          if (!val || !Array.isArray(val.links) || typeof val.url !== 'string') {
+            console.warn('harvestLinks: unexpected evaluate result shape', res && Object.keys(res));
+            return;
+          }
           const fresh = val.links.filter((l: any) => l && typeof l.t === 'string' && typeof l.h === 'string' && !seenHrefs.has(l.h));
           if (!fresh.length) return;
           for (const l of fresh) seenHrefs.add(l.h);
