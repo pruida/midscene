@@ -121,10 +121,18 @@ export function installQiyuanBridge() {
             return `<div style="display:flex;gap:6px;align-items:baseline;padding:2px 0">${icon}<span style="color:#999;font-variant-numeric:tabular-nums;white-space:nowrap">${fmtTime(s.ts)}</span><div style="min-width:0"><b>${esc(s.kind)}</b> <span style="color:#555;overflow-wrap:anywhere">${esc(s.text)}</span>${dur}</div></div>`;
           }).join('');
           root.style.cssText = 'position:fixed;inset:0;background:#fff;z-index:9999;overflow-y:auto;padding:16px;font:13px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;box-sizing:border-box';
-          root.innerHTML = `<div style="font-size:15px;font-weight:600;color:${color};margin-bottom:6px">${headText}</div>`
-            + (lastTip ? `<div style="color:#666;font-size:12px;margin-bottom:10px">${esc(lastTip)}</div>` : '')
-            + (panelResultText ? `<div style="color:#333;font-size:13px;margin-bottom:10px;white-space:pre-wrap;overflow-wrap:anywhere">${esc(panelResultText)}</div>` : '')
-            + `<div style="border-left:2px solid #e5e7eb;padding-left:10px">${rows}</div>`;
+          // 状态头 sticky 吸顶：面板自动滚到底部展示最新步骤时，完成/失败
+          // 横幅仍然可见；终态再额外在时间线末尾放一条横幅，双保险。
+          const headBlock = `<div style="position:sticky;top:-16px;background:#fff;padding:8px 0 6px;margin:-8px 0 6px;border-bottom:1px solid #eee;z-index:1">`
+            + `<div style="font-size:15px;font-weight:600;color:${color}">${headText}</div>`
+            + (lastTip && panelState === 'running' ? `<div style="color:#666;font-size:12px;margin-top:2px">${esc(lastTip)}</div>` : '')
+            + (panelResultText ? `<div style="color:#333;font-size:13px;margin-top:4px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:200px;overflow-y:auto">${esc(panelResultText)}</div>` : '')
+            + `</div>`;
+          const tailBanner = panelState === 'running' ? ''
+            : `<div style="margin-top:12px;padding:10px 12px;border:1px solid ${color};border-radius:8px;color:${color};font-weight:600">${headText}，完整结果与回放视频见对话页</div>`;
+          root.innerHTML = headBlock
+            + `<div style="border-left:2px solid #e5e7eb;padding-left:10px">${rows}</div>`
+            + tailBanner;
           root.scrollTop = root.scrollHeight;
         } catch { /* 面板渲染失败不影响任务 */ }
       };
@@ -270,10 +278,18 @@ export function installQiyuanBridge() {
       // 汇总提示：把执行中采集到的真实链接列表交给模型，只允许用这些链接。
       const buildSummaryPrompt = (limitNote: string) => {
         const links = linkCorpusText();
+        // 汇总 aiAsk 只能看到最后一页截图，模型物理上不可能凭截图列出几十条
+        // 结果——真正的收集成果都在各步「规划」的观察笔记里，必须喂回去。
+        const notes = (() => {
+          const lines = steps.filter(s => s.text).map((s, i) => `${i + 1}. [${s.kind}] ${s.text}`);
+          const text = lines.join('\n');
+          return text.length > 9000 ? text.slice(-9000) : text;
+        })();
         const linkBlock = links
-          ? `\n\n以下是执行过程中从页面 DOM 提取的真实链接列表（锚文本 → 网址）。如果任务要求附带链接：每一条结果的标题/来源必须写成可点击的 markdown 链接（格式：[标题](网址)），直接嵌在表格或列表的对应行里——读者看到感兴趣的条目要能立即点开原文，只把链接堆在文末是不可接受的。网址必须只取自下面列表，禁止编造或猜测任何不在列表中的链接；列表里找不到合适链接的条目，该行就不放链接（保留纯文本标题），并在末尾注明该条目链接缺失：\n${links}`
+          ? `\n\n以下是执行过程中从页面 DOM 提取的真实链接列表（锚文本 → 网址）。表格每一行的「链接」列必须写成可点击的 markdown 链接（格式：[查看原文](网址)），网址必须只取自下面列表，按锚文本与条目标题的相似度配对，禁止编造或猜测任何不在列表中的链接；列表里找不到合适链接的条目，该行链接列留空并注明"链接缺失"：\n${links}`
           : '\n\n注意：本次未能从页面提取到任何真实链接。如果任务要求附带链接，如实说明无法获取链接，绝对不要编造网址，也不要声称链接会由系统附上。';
-        return `用户要求在网页上完成：「${prompt}」。${limitNote}请基于当前页面的实际内容和已完成的工作，用简洁中文汇总用户想要的结果本身（例如搜索到的主要信息/条目，逐条列出），不要描述执行了哪些操作；如果任务要求返回若干条结果（如前 N 条/列表），必须用 markdown 表格逐条列出（表头：| 序号 | 标题 | 来源 | 链接 |，一行一条结果），表格行数多没关系、不受字数限制，表格之外的说明文字 800 字以内；如果还没有收集到任何内容，就直接说"暂无有效结果"。${linkBlock}`;
+        const notesBlock = notes ? `\n\n以下是执行过程中每一步的观察笔记（各步骤看到的结果条目都记录在内）。结果表格的条目必须主要来自这些笔记，绝对不要只凭最后一页看到的内容概述，也不要只给笼统总结：\n${notes}` : '';
+        return `用户要求在网页上完成：「${prompt}」。${limitNote}请基于下方观察笔记和当前页面内容，用中文输出用户想要的结果本身。硬性格式要求：只要任务要求返回若干条结果（如前 N 条/列表/汇总），输出必须是一个 markdown 表格，表头固定为 | 序号 | 标题 | 来源 | 链接 |，一行一条结果，逐条列出、条数尽量满足任务要求，表格不受任何字数限制；表格之外可以补一段 800 字以内的总体说明。示例行：| 1 | Introducing Claude Opus 5 | Anthropic 官网 | [查看原文](https://example.com/post) |。如果笔记里确实没有收集到任何条目，就直接说"暂无有效结果"，不要编造。${notesBlock}${linkBlock}`;
       };
       // 确定性兜底：采集到的链接直接作为数据放进结果，不依赖模型自觉。
       const flattenLinks = () => {
@@ -405,9 +421,10 @@ export function installQiyuanBridge() {
         finalOutcome = { result: '任务已完成（结果超出对话容量，请回看过程视频）', ...uploadOutcome };
       }
       // 面板终态：和对话页同一口径（取消/失败/完成 + 结果摘要）。
-      panelState = abort.signal.aborted ? 'cancelled'
-        : (finalOutcome && typeof finalOutcome === 'object' && 'error' in finalOutcome ? 'failed' : 'done');
-      panelResultText = String((finalOutcome as Record<string, unknown>).result ?? (finalOutcome as Record<string, unknown>).error ?? '').slice(0, 2000);
+      // 注意必须判值非空而非键存在——aiAct 的 outcome 固定带 error:null。
+      const outcomeError = (finalOutcome as Record<string, unknown>).error;
+      panelState = abort.signal.aborted ? 'cancelled' : (outcomeError != null && outcomeError !== '' ? 'failed' : 'done');
+      panelResultText = String((finalOutcome as Record<string, unknown>).result ?? outcomeError ?? '').slice(0, 2000);
       postProgress(true); // flush the complete timeline before the terminal post
       await request('result', { outcome: finalOutcome, cancelled: abort.signal.aborted });
       } catch (error) {
