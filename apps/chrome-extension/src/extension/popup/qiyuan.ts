@@ -35,9 +35,25 @@ export function installQiyuanBridge() {
       // tabs are never navigated, and the model drives this tab end to end.
       // The explicit 「使用浏览器插件」 prefix is the user's consent, so no
       // extra confirm dialog is needed.
-      // 起始页用 Google 而不是空白页：追问类任务（"再找50篇"）没有点名网站时，
-      // 模型面对空白页容易直接放弃；给一个可用的搜索页作为起点。
-      const tab = await chrome.tabs.create({ url: 'https://www.google.com/', active: true });
+      // 起始页：任务点名了具体网站就直接从该站官网起步（用户要的是站内
+      // 热门内容，Google site: 搜不出来），否则默认 Google 搜索页。
+      // 只匹配用户本次的指令文本，不匹配对话上下文里提到的旧站点。
+      const userIntent = prompt.split('【对话上下文')[0];
+      const SITE_STARTS: Array<[RegExp, string]> = [
+        [/抖音|douyin/i, 'https://www.douyin.com/'],
+        [/小红书|xiaohongshu|redbook/i, 'https://www.xiaohongshu.com/'],
+        [/哔哩哔哩|bilibili|b站/i, 'https://www.bilibili.com/'],
+        [/知乎/i, 'https://www.zhihu.com/'],
+        [/微博/i, 'https://weibo.com/'],
+        [/淘宝|天猫/i, 'https://www.taobao.com/'],
+        [/京东/i, 'https://www.jd.com/'],
+        [/reddit/i, 'https://www.reddit.com/'],
+        [/x\.com|twitter|推特/i, 'https://x.com/'],
+        [/youtube|油管/i, 'https://www.youtube.com/'],
+        [/github/i, 'https://github.com/'],
+      ];
+      const startUrl = (SITE_STARTS.find(([re]) => re.test(userIntent)) || [null, 'https://www.google.com/'])[1] as string;
+      const tab = await chrome.tabs.create({ url: startUrl, active: true });
       reservation.abort.signal.throwIfAborted();
       if (!tab?.id) throw new Error('无法新建任务标签页');
       // 等起始页加载完再接管：页面还在 loading 时 debugger 截图会报
@@ -312,7 +328,7 @@ export function installQiyuanBridge() {
       let outcome: unknown;
       // 模型只看截图看不到 href，「带链接」类需求会逼它诚实认输。提前声明：
       // 链接由系统自动提取，它只需浏览阅读，不用记录网址。
-      const actPrompt = `${prompt}\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。注意：任务从一个空白新标签页开始——需要浏览网页时请直接用「浏览」动作打开合适的网站（如 Google/Bing 搜索、任务或对话上下文里提到的站点），主动搜索任务主题；当前页空白不是放弃的理由，禁止因为页面空白就结束任务。效率要求：搜索结果每页约 10 条，浏览 5–8 页通常就足够；标题和摘要级别的候选即可计入结果，不需要逐个打开帖子核实正文，也不要因为"摘要不够详细""可能是转述"这类理由排除候选——判断是否与此前结果重复只看标题或链接是否相同。收集到任务要求数量的候选后必须立即停止浏览；连续两页没有新的相关结果时也必须停止，然后正常结束任务。）`;
+      const actPrompt = `${prompt}\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。注意：任务从一个空白新标签页开始——需要浏览网页时请直接用「浏览」动作打开合适的网站（如 Google/Bing 搜索、任务或对话上下文里提到的站点），主动搜索任务主题；当前页空白不是放弃的理由，禁止因为页面空白就结束任务。站点直达要求：如果任务（或对话上下文）指定了具体网站/平台（如抖音、小红书、B站、知乎、微博、淘宝、X、Reddit 等），必须用「浏览」直接打开该网站官网，并用它的站内搜索功能搜索任务关键词；禁止只用 Google 搜索或 site: 语法代替站内搜索——用户要的是该平台站内 browse 到的热门内容（点赞/热度信息只有站内才看得到）。任务点名多个网站时逐站完成，不要遗漏。效率要求：搜索结果每页约 10 条，浏览 5–8 页通常就足够；标题和摘要级别的候选即可计入结果，不需要逐个打开帖子核实正文，也不要因为"摘要不够详细""可能是转述"这类理由排除候选——判断是否与此前结果重复只看标题或链接是否相同。收集到任务要求数量的候选后必须立即停止浏览；连续两页没有新的相关结果时也必须停止，然后正常结束任务。）`;
       // 汇总提示：把执行中采集到的真实链接列表交给模型，只允许用这些链接。
       const buildSummaryPrompt = (limitNote: string) => {
         const links = linkCorpusText();
