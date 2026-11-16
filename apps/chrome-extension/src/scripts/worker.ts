@@ -448,8 +448,14 @@ chrome.runtime.onConnect.addListener((port) => {
 chrome.runtime.onMessageExternal.addListener((request, sender, sendResponse) => {
   let trusted = false;
   try { trusted = new URL(sender.url || '').origin === 'https://ai.qykaiwu.cn'; } catch {}
-  if (!trusted || sender.frameId !== 0 || sender.tab?.id == null || !['run', 'cancel', 'replay'].includes(request?.type)) {
+  if (!trusted || sender.frameId !== 0 || sender.tab?.id == null || !['run', 'cancel', 'replay', 'ping'].includes(request?.type)) {
     sendResponse({ ok: false, error: 'Untrusted sender' });
+    return false;
+  }
+  // Version probe: answered by the worker itself so the chat page can gate
+  // outdated extensions before creating a task, even with the panel closed.
+  if (request.type === 'ping') {
+    sendResponse({ ok: true, version: chrome.runtime.getManifest().version });
     return false;
   }
   // Replay opens a local player page for a video stored in the extension's
