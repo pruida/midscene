@@ -356,6 +356,30 @@ export function installQiyuanBridge() {
         }
         return out;
       };
+      // 模型有时会抛开固定表头自由发挥、丢掉「链接」列。汇总文本生成后做
+      // 确定性注入：语料里的锚文本若在汇总中仍以纯文本出现（不是已有
+      // markdown 链接的可见文字、该网址也没出现过），就替换成 [标题](网址)。
+      const injectLinks = (text: string) => {
+        if (!text) return text;
+        const entries = flattenLinks()
+          .filter(l => l.t && l.t.length >= 6 && !text.includes(`](${l.h})`))
+          .sort((a, b) => b.t.length - a.t.length);
+        let out = text;
+        for (const { t, h } of entries) {
+          if (out.includes(`](${h})`)) continue;
+          // 模型可能截断或微调长标题，逐级缩短前缀找匹配
+          for (const len of [60, 40, 25, 12]) {
+            const needle = t.slice(0, len);
+            const idx = out.indexOf(needle);
+            // 前面是 `[` 说明它已经是某个 markdown 链接的可见文字，不动
+            if (idx >= 0 && out[idx - 1] !== '[') {
+              out = out.slice(0, idx) + `[${needle}](${h})` + out.slice(idx + needle.length);
+              break;
+            }
+          }
+        }
+        return out;
+      };
       try {
         // Hard cap: if the agent loop stalls (dead page, wedged navigation),
         // abort so /result is still posted while this context is alive. The
@@ -375,7 +399,7 @@ export function installQiyuanBridge() {
         let partialSummary = '';
         try {
           const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: buildSummaryPrompt('任务因故被提前结束。') }, { requestId: `${message.taskId}-partial`, abortSignal: abort.signal });
-          partialSummary = typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : '');
+          partialSummary = injectLinks(typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : ''));
         } catch { /* 汇总失败时给出兜底文案 */ }
         outcome = { result: partialSummary.trim() || `任务未能完成：${errorMessage}`, partial: true };
         }
@@ -388,7 +412,7 @@ export function installQiyuanBridge() {
         pushTip(seenHrefs.size ? `已采集到 ${seenHrefs.size} 条页面真实链接，正在汇总…` : '未能从页面提取到链接，正在汇总…');
         try {
           const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: buildSummaryPrompt('') }, { requestId: `${message.taskId}-ask`, abortSignal: abort.signal });
-          const answer = typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : '');
+          const answer = injectLinks(typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : ''));
           if (answer.trim()) {
             outcome = outcome && typeof outcome === 'object' && !Array.isArray(outcome)
               ? { ...(outcome as Record<string, unknown>), result: answer }
