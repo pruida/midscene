@@ -123,6 +123,9 @@ export function installQiyuanBridge() {
       // 停止按钮的二次确认状态：第一次点击进入"再点一次确认"，5 秒不点自动还原。
       let stopArmed = false;
       let stopArmTimer: ReturnType<typeof setTimeout> | undefined;
+      // 等待用户回答的澄清问题：卡片渲染在面板顶部，用户可在侧边栏直接回答。
+      let pendingClarification: { questionId: string; question: string; status: 'waiting' | 'submitting' | 'error'; draft: string; errorText?: string } | null = null;
+      const clarificationDraftById: Record<string, string> = {};
       const renderPanel = () => {
         try {
           if (typeof document === 'undefined') return;
@@ -166,9 +169,64 @@ export function installQiyuanBridge() {
             + `</div>`;
           const tailBanner = panelState === 'running' ? ''
             : `<div style="margin-top:12px;padding:10px 12px;border:1px solid ${color};border-radius:8px;color:${color};font-weight:600">${headText}，完整结果与回放视频见对话页</div>`;
+          // 待答问题卡片：任务暂停等待用户输入，可在此处或对话页回答。
+          const clarBlock = pendingClarification && panelState === 'running'
+            ? `<div style="margin:8px 0 10px;padding:12px;border:1px solid #f59e0b;background:#fffbeb;border-radius:10px">`
+              + `<div style="font-weight:600;color:#92400e;margin-bottom:6px">❓ 任务需要你确认后才能继续</div>`
+              + `<div style="color:#333;white-space:pre-wrap;overflow-wrap:anywhere;margin-bottom:8px">${esc(pendingClarification.question)}</div>`
+              + `<div style="display:flex;gap:8px"><input id="qiyuan-clar-input" type="text" placeholder="输入你的回答…" value="${esc(pendingClarification.draft)}" style="flex:1;padding:6px 10px;border:1px solid #d97706;border-radius:6px;font-size:13px">`
+              + `<button id="qiyuan-clar-submit" style="padding:6px 14px;border:none;border-radius:6px;background:#f59e0b;color:#fff;font-size:13px;cursor:pointer" ${pendingClarification.status === 'submitting' ? 'disabled' : ''}>${pendingClarification.status === 'submitting' ? '提交中…' : '提交回答'}</button></div>`
+              + (pendingClarification.errorText ? `<div style="color:#c00;font-size:12px;margin-top:6px">${esc(pendingClarification.errorText)}</div>` : '')
+              + `</div>`
+            : '';
+          const clarHadFocus = (document.activeElement as HTMLElement | null)?.id === 'qiyuan-clar-input';
           root.innerHTML = headBlock
+            + clarBlock
             + `<div style="border-left:2px solid #e5e7eb;padding-left:10px">${rows}</div>`
             + tailBanner;
+          // 待答卡片：保留草稿与焦点（进度刷新会重建 DOM），提交走 capability
+          // 授权的 /answer，提交成功后扩展轮询到回答即自动继续。
+          const clarInput = root.querySelector('#qiyuan-clar-input') as HTMLInputElement | null;
+          const clarSubmit = root.querySelector('#qiyuan-clar-submit') as HTMLButtonElement | null;
+          if (clarInput && pendingClarification) {
+            clarInput.oninput = () => {
+              if (!pendingClarification) return;
+              pendingClarification.draft = clarInput.value;
+              clarificationDraftById[pendingClarification.questionId] = clarInput.value;
+            };
+            const submitClarification = async () => {
+              const pending = pendingClarification;
+              if (!pending || pending.status === 'submitting') return;
+              const answer = (clarInput.value || '').trim();
+              if (!answer) { pending.errorText = '请输入回答内容'; renderPanel(); return; }
+              pending.status = 'submitting';
+              pending.errorText = undefined;
+              renderPanel();
+              try {
+                const resp = await fetch(`${url}/answer`, {
+                  method: 'POST', credentials: 'omit', redirect: 'error',
+                  signal: AbortSignal.any([abort.signal, AbortSignal.timeout(15000)]),
+                  headers: { authorization: `Bearer ${message.capability}`, 'content-type': 'application/json' },
+                  body: JSON.stringify({ questionId: pending.questionId, answer }),
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                if (pendingClarification === pending) { pendingClarification.status = 'waiting'; pendingClarification.errorText = undefined; renderPanel(); }
+              } catch (e) {
+                if (pendingClarification === pending) {
+                  pendingClarification.status = 'error';
+                  pendingClarification.errorText = `提交失败（${e instanceof Error ? e.message : String(e)}），请重试或在对话页回答`;
+                  renderPanel();
+                }
+              }
+            };
+            if (clarSubmit) clarSubmit.onclick = () => { void submitClarification(); };
+            clarInput.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); void submitClarification(); } };
+            // 重新渲染后恢复焦点（用户正在输入时进度刷新不打断）
+            if (clarHadFocus) {
+              clarInput.focus();
+              clarInput.setSelectionRange(clarInput.value.length, clarInput.value.length);
+            }
+          }
           // 停止按钮：第一次点击进入确认态（重渲染后由 stopArmed 保持文案），
           // 确认态下再点才真正 abort；确认后任务走取消终态并照常回传 /result。
           const stopEl = root.querySelector('#qiyuan-stop-btn') as HTMLButtonElement | null;
@@ -213,7 +271,18 @@ export function installQiyuanBridge() {
       const originalActionSpace = page.actionSpace.bind(page);
       page.actionSpace = () => [...originalActionSpace(), clarificationAction({
         url, capability: message.capability, signal: abort.signal,
-        onWaiting: () => pushTip('等待用户回答问题…'),
+        onWaiting: (info) => {
+          pushTip('等待用户回答问题…');
+          pendingClarification = { ...info, status: 'waiting', draft: clarificationDraftById[info.questionId] || '' };
+          renderPanel();
+        },
+        onAnswered: () => {
+          if (pendingClarification) {
+            delete clarificationDraftById[pendingClarification.questionId];
+            pendingClarification = null;
+            renderPanel();
+          }
+        },
         // Midscene normally replans after action errors. Stop instead: retrying
         // after an uncertain question submission can repeat unrelated actions.
         onFailure: () => { clarificationFailed = !abort.signal.aborted; abort.abort(); },
@@ -230,8 +299,13 @@ export function installQiyuanBridge() {
         try {
           const res: any = await page.evaluateJavaScript(`(() => {
             const out = [];
+            // 只采集正文区链接：导航/侧栏/页头页脚里的链接（备案、协议、
+            // 无关会话列表等）与任务无关，混进语料会让汇总附上无关链接。
+            const CHROME_SEL = 'nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"], [class*="sidebar" i], [class*="side-bar" i], [id*="sidebar" i], [class*="site-footer" i], [class*="page-footer" i]';
             for (const a of document.querySelectorAll('a[href]')) {
-              const t = (a.innerText || a.textContent || '').replace(/\\s+/g, ' ').trim();
+              if (a.closest(CHROME_SEL)) continue;
+              let t = (a.innerText || a.textContent || '').replace(/\\s+/g, ' ').trim();
+              if (/[⌘⇧⌥⌃]/.test(t)) continue; // 带快捷键提示的多为界面入口
               if (t.length < 6) continue;
               const h = a.href;
               if (!/^https?:/.test(h) || h.includes('google.com/search') || h.includes('#')) continue;
