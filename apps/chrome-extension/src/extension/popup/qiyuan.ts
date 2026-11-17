@@ -6,6 +6,7 @@ import {
 } from '@midscene/visualizer';
 import { ChromeExtensionProxyPage, ChromeExtensionProxyPageAgent } from '@midscene/web/chrome-extension';
 import { saveReplayVideo } from '../replay-store';
+import { clarificationAction } from './clarification';
 
 // Prototype only: endpoints require a backend that does not yet exist.
 const SITE = 'https://ai.qykaiwu.cn';
@@ -208,6 +209,15 @@ export function installQiyuanBridge() {
       };
       const kindLabel = (name: string) => KIND_LABELS[name] || name;
       const page = new ChromeExtensionProxyPage(true);
+      let clarificationFailed = false;
+      const originalActionSpace = page.actionSpace.bind(page);
+      page.actionSpace = () => [...originalActionSpace(), clarificationAction({
+        url, capability: message.capability, signal: abort.signal,
+        onWaiting: () => pushTip('等待用户回答问题…'),
+        // Midscene normally replans after action errors. Stop instead: retrying
+        // after an uncertain question submission can repeat unrelated actions.
+        onFailure: () => { clarificationFailed = !abort.signal.aborted; abort.abort(); },
+      })];
       await page.setActiveTabId(tab.id, { activate: false });
       // 链接语料库：Midscene 是纯视觉管线，模型只看截图、看不到 href。
       // 「每条带原文链接」类任务因此必然失败（模型只能诚实拒绝）。这里在
@@ -328,7 +338,7 @@ export function installQiyuanBridge() {
       let outcome: unknown;
       // 模型只看截图看不到 href，「带链接」类需求会逼它诚实认输。提前声明：
       // 链接由系统自动提取，它只需浏览阅读，不用记录网址。
-      const actPrompt = `${prompt}\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。注意：任务从一个空白新标签页开始——需要浏览网页时请直接用「浏览」动作打开合适的网站（如 Google/Bing 搜索、任务或对话上下文里提到的站点），主动搜索任务主题；当前页空白不是放弃的理由，禁止因为页面空白就结束任务。站点直达要求：如果任务（或对话上下文）指定了具体网站/平台（如抖音、小红书、B站、知乎、微博、淘宝、X、Reddit 等），必须用「浏览」直接打开该网站官网，并用它的站内搜索功能搜索任务关键词；禁止只用 Google 搜索或 site: 语法代替站内搜索——用户要的是该平台站内 browse 到的热门内容（点赞/热度信息只有站内才看得到）。任务点名多个网站时逐站完成，不要遗漏。效率要求：搜索结果每页约 10 条，浏览 5–8 页通常就足够；标题和摘要级别的候选即可计入结果，不需要逐个打开帖子核实正文，也不要因为"摘要不够详细""可能是转述"这类理由排除候选——判断是否与此前结果重复只看标题或链接是否相同。收集到任务要求数量的候选后必须立即停止浏览；连续两页没有新的相关结果时也必须停止，然后正常结束任务。）`;
+      const actPrompt = `${prompt}\n\n（如果完成任务必须先由用户提供缺失信息或作出选择，使用 AskUser 动作提出明确问题，等待答复；不要猜测或继续执行，也不要在同一轮安排其他动作。不要询问密码、验证码或支付凭据。）\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。注意：任务从一个空白新标签页开始——需要浏览网页时请直接用「浏览」动作打开合适的网站（如 Google/Bing 搜索、任务或对话上下文里提到的站点），主动搜索任务主题；当前页空白不是放弃的理由，禁止因为页面空白就结束任务。站点直达要求：如果任务（或对话上下文）指定了具体网站/平台（如抖音、小红书、B站、知乎、微博、淘宝、X、Reddit 等），必须用「浏览」直接打开该网站官网，并用它的站内搜索功能搜索任务关键词；禁止只用 Google 搜索或 site: 语法代替站内搜索——用户要的是该平台站内 browse 到的热门内容（点赞/热度信息只有站内才看得到）。任务点名多个网站时逐站完成，不要遗漏。效率要求：搜索结果每页约 10 条，浏览 5–8 页通常就足够；标题和摘要级别的候选即可计入结果，不需要逐个打开帖子核实正文，也不要因为"摘要不够详细""可能是转述"这类理由排除候选——判断是否与此前结果重复只看标题或链接是否相同。收集到任务要求数量的候选后必须立即停止浏览；连续两页没有新的相关结果时也必须停止，然后正常结束任务。）`;
       // 汇总提示：把执行中采集到的真实链接列表交给模型，只允许用这些链接。
       const buildSummaryPrompt = (limitNote: string) => {
         const links = linkCorpusText();
@@ -386,9 +396,12 @@ export function installQiyuanBridge() {
         // backend watchdog (15 min silence) is the fallback if WE die instead.
         const actSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(30 * 60_000)]);
         outcome = await sdk.executeAction('aiAct', { type: 'aiAct', prompt: actPrompt }, { requestId: message.taskId, abortSignal: actSignal });
+        if (clarificationFailed) throw new Error('无法取得用户答复，已安全停止任务');
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
-        if (abort.signal.aborted) {
+        if (clarificationFailed) {
+          outcome = { error: '无法取得用户答复，已安全停止任务。' };
+        } else if (abort.signal.aborted) {
           // 用户点了停止：跳过半路汇总，直接终态，别再用 aborted 信号空转。
           outcome = { result: '任务已被用户停止。', partial: true };
         } else {
@@ -506,10 +519,10 @@ export function installQiyuanBridge() {
       // 面板终态：和对话页同一口径（取消/失败/完成 + 结果摘要）。
       // 注意必须判值非空而非键存在——aiAct 的 outcome 固定带 error:null。
       const outcomeError = (finalOutcome as Record<string, unknown>).error;
-      panelState = abort.signal.aborted ? 'cancelled' : (outcomeError != null && outcomeError !== '' ? 'failed' : 'done');
+      panelState = clarificationFailed ? 'failed' : abort.signal.aborted ? 'cancelled' : (outcomeError != null && outcomeError !== '' ? 'failed' : 'done');
       panelResultText = String((finalOutcome as Record<string, unknown>).result ?? outcomeError ?? '').slice(0, 2000);
       postProgress(true); // flush the complete timeline before the terminal post
-      await request('result', { outcome: finalOutcome, cancelled: abort.signal.aborted });
+      await request('result', { outcome: finalOutcome, cancelled: abort.signal.aborted && !clarificationFailed });
       } catch (error) {
         // 面板变量都声明在 try 块内、catch 里不可见；如果面板已渲染过，直接
         // 把标题翻成失败态即可。
