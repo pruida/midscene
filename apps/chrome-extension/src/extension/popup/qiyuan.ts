@@ -350,10 +350,13 @@ export function installQiyuanBridge() {
         replanningCycleLimit: 100,
         // SDK constructor requires a nonempty value; this sentinel is not a key
         // and the custom client never transmits it.
-        modelConfig: { MIDSCENE_MODEL_NAME: 'gpt-6-astra', MIDSCENE_MODEL_FAMILY: message.modelFamily, MIDSCENE_MODEL_API_KEY: 'not-a-secret', MIDSCENE_MODEL_BASE_URL: `${SITE}/api/browser-plugin/tasks/${message.taskId}/model`, MIDSCENE_MODEL_STREAM_MODE: 'non-stream', MIDSCENE_MODEL_PROTOCOL: 'openai-responses' },
+        // 模型名同理：只是占位符，真正用哪个模型永远由服务端决定（见下方 delete body.model），
+        // 插件自身不含任何模型名，服务端升级模型无需发新版插件。
+        modelConfig: { MIDSCENE_MODEL_NAME: 'qiyuan-plugin', MIDSCENE_MODEL_FAMILY: message.modelFamily, MIDSCENE_MODEL_API_KEY: 'not-a-secret', MIDSCENE_MODEL_BASE_URL: `${SITE}/api/browser-plugin/tasks/${message.taskId}/model`, MIDSCENE_MODEL_STREAM_MODE: 'non-stream', MIDSCENE_MODEL_PROTOCOL: 'openai-responses' },
         createOpenAIClient: async (client: any) => new Proxy(client, { get(target, key, receiver) {
           if (key === 'responses') return { create: (body: any, options: any = {}) => {
             if (body.stream) throw new Error('Streaming unsupported');
+            delete body.model; // 模型由服务端决定，插件不发送模型名
             return request('model', body, options.signal || abort.signal);
           } };
           if (key === 'chat') throw new Error('Only Responses protocol is supported');
