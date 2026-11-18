@@ -1,7 +1,7 @@
 {
   "name": "启源浏览器助手",
   "description": "Open-source SDK for automating web pages using natural language through AI.",
-  "version": "1.20.0",
+  "version": "1.21.0",
   "manifest_version": 3,
   "externally_connectable": {
     "matches": [
