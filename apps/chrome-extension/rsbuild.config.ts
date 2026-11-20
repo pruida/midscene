@@ -42,9 +42,9 @@ export default defineConfig({
       html: {
         title: ({ entryName }) => {
           if (entryName === 'confirm') {
-            return '启源浏览器助手 Bridge';
+            return '启源开物浏览器助手 Bridge';
           }
-          return '启源浏览器助手';
+          return '启源开物浏览器助手';
         },
       },
       output: {

@@ -24,7 +24,7 @@ export function PlaygroundPopup() {
       }}
     >
       <div style={{ fontSize: 20, fontWeight: 600, marginBottom: 12 }}>
-        欢迎使用启源浏览器助手
+        欢迎使用启源开物浏览器助手
       </div>
       <div style={{ fontSize: 13, color: '#888', lineHeight: 1.8 }}>
         请在 ai.qykaiwu.cn 对话中
