@@ -72,13 +72,13 @@ function ConfirmDialog() {
       <AntdApp component={false}>
         <div className="confirm-dialog">
           <div className="confirm-header">
-            <img src="/icon128.png" alt="启源浏览器助手" className="confirm-logo" />
-            <h2 className="confirm-title">启源浏览器助手 Bridge</h2>
+            <img src="/icon128.png" alt="启源开物浏览器助手" className="confirm-logo" />
+            <h2 className="confirm-title">启源开物浏览器助手 Bridge</h2>
           </div>
 
           <div className="confirm-content">
             <p className="confirm-message">
-              启源浏览器助手 CLI 正在请求控制此浏览器。
+              启源开物浏览器助手 CLI 正在请求控制此浏览器。
             </p>
             <div className="server-info">
               <span className="server-label">Server:</span>
