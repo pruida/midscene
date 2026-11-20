@@ -7,6 +7,7 @@ import {
 import { ChromeExtensionProxyPage, ChromeExtensionProxyPageAgent } from '@midscene/web/chrome-extension';
 import { saveReplayVideo } from '../replay-store';
 import { clarificationAction } from './clarification';
+import { navigateWithFailover, selectStartUrls } from './qiyuan-navigation';
 
 // Prototype only: endpoints require a backend that does not yet exist.
 const SITE = 'https://ai.qykaiwu.cn';
@@ -36,25 +37,35 @@ export function installQiyuanBridge() {
       // tabs are never navigated, and the model drives this tab end to end.
       // The explicit 「使用浏览器插件」 prefix is the user's consent, so no
       // extra confirm dialog is needed.
-      // 起始页：任务点名了具体网站就直接从该站官网起步（用户要的是站内
-      // 热门内容，Google site: 搜不出来），否则默认 Google 搜索页。
+      // 起始页：点名平台时直接进该站；未指定搜索站时默认百度，失败后有界切换。
       // 只匹配用户本次的指令文本，不匹配对话上下文里提到的旧站点。
       const userIntent = prompt.split('【对话上下文')[0];
-      const SITE_STARTS: Array<[RegExp, string]> = [
-        [/抖音|douyin/i, 'https://www.douyin.com/'],
-        [/小红书|xiaohongshu|redbook/i, 'https://www.xiaohongshu.com/'],
-        [/哔哩哔哩|bilibili|b站/i, 'https://www.bilibili.com/'],
-        [/知乎/i, 'https://www.zhihu.com/'],
-        [/微博/i, 'https://weibo.com/'],
-        [/淘宝|天猫/i, 'https://www.taobao.com/'],
-        [/京东/i, 'https://www.jd.com/'],
-        [/reddit/i, 'https://www.reddit.com/'],
-        [/x\.com|twitter|推特/i, 'https://x.com/'],
-        [/youtube|油管/i, 'https://www.youtube.com/'],
-        [/github/i, 'https://github.com/'],
-      ];
-      const startUrl = (SITE_STARTS.find(([re]) => re.test(userIntent)) || [null, 'https://www.google.com/'])[1] as string;
-      const tab = await chrome.tabs.create({ url: startUrl, active: true });
+      const startUrls = selectStartUrls(userIntent);
+      const navigationNotices: string[] = [];
+      // Reuse only a page explicitly identified in this turn, never a URL in chat history.
+      const existing = /(?:已经?|当前|正在)(?:在浏览器(?:中|里)?)?(?:打开|开启)(?:着)?的|已打开的/.exec(userIntent);
+      let tab: chrome.tabs.Tab;
+      if (existing) {
+        const after = userIntent.slice(existing.index + existing[0].length);
+        const raw = /^[\s页面网页标签地址链接：:「“]*(https?:\/\/[^\s，。；、」”<>]+)/i.exec(after)?.[1];
+        if (!raw) throw new Error('请提供已打开页面的完整网址；不会新建标签页。');
+        const target = new URL(raw);
+        const matches = (await chrome.tabs.query({ currentWindow: true })).filter(t =>
+          t.id !== message.targetTabId && t.url === target.href && !t.pendingUrl && !t.discarded);
+        const match = matches.length === 1 ? matches[0] : matches.find(t => t.active);
+        if (!match?.id) throw new Error(matches.length ? '有多个相同页面，请选中要使用的标签页后重试。' : '当前窗口未找到指定的已打开页面，请确认网址和窗口后重试。');
+        tab = await chrome.tabs.update(match.id, { active: true });
+        if (tab.url !== target.href || tab.pendingUrl) throw new Error('目标页面已变化，请重新确认。');
+      } else {
+        tab = await chrome.tabs.create({ url: 'about:blank', active: true });
+        if (!tab.id) throw new Error('无法新建任务标签页');
+        tab = await navigateWithFailover(tab.id, startUrls, reservation.abort.signal, {
+          onFallback: ({ from, to }) => {
+            const host = (value: string) => new URL(value).hostname.replace(/^www\./, '');
+            navigationNotices.push(`${host(from)} 起始页访问失败，已自动切换到 ${host(to)}。`);
+          },
+        });
+      }
       reservation.abort.signal.throwIfAborted();
       if (!tab?.id) throw new Error('无法新建任务标签页');
       // 等起始页加载完再接管：页面还在 loading 时 debugger 截图会报
@@ -136,6 +147,19 @@ export function installQiyuanBridge() {
             (document.body || document.documentElement).appendChild(root);
           }
           const esc = (v: unknown) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          const formatResult = (text: string) => {
+            const inline = (s: string) => esc(s).replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+            const cells = (s: string) => s.trim().replace(/^\||\|$/g,'').split('|').map(c=>c.trim());
+            const lines = text.split(/\r?\n/), out: string[] = [];
+            for (let i=0;i<lines.length;i++) {
+              if(lines[i].includes('|') && lines[i+1]?.includes('|') && cells(lines[i+1]).every(c=>/^:?-{2,}:?$/.test(c))) {
+                const row=(line:string,tag:'th'|'td')=>'<tr>'+cells(line).map(c=>`<${tag} style="padding:5px;border:1px solid #ddd;vertical-align:top">${inline(c)}</${tag}>`).join('')+'</tr>';
+                const rows=[row(lines[i++],'th')]; while(lines[i+1]?.includes('|')) rows.push(row(lines[++i],'td'));
+                out.push('<div style="overflow-x:auto"><table style="border-collapse:collapse">'+rows.join('')+'</table></div>');
+              } else if(lines[i].trim()) out.push('<p style="margin:6px 0">'+inline(lines[i])+'</p>');
+            }
+            return out.join('');
+          };
           const fmtDur = (ms?: number) => {
             if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) return '';
             const s = ms / 1000;
@@ -165,7 +189,7 @@ export function installQiyuanBridge() {
           const headBlock = `<div style="position:sticky;top:-16px;background:#fff;padding:8px 0 6px;margin:-8px 0 6px;border-bottom:1px solid #eee;z-index:1">`
             + `<div style="font-size:15px;font-weight:600;color:${color}">${headText}${stopBtn}</div>`
             + (lastTip && panelState === 'running' ? `<div style="color:#666;font-size:12px;margin-top:2px">${esc(lastTip)}</div>` : '')
-            + (panelResultText ? `<div style="color:#333;font-size:13px;margin-top:4px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:200px;overflow-y:auto">${esc(panelResultText)}</div>` : '')
+            + (panelResultText ? `<div style="color:#333;font-size:13px;margin-top:4px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:200px;overflow-y:auto">${formatResult(panelResultText)}</div>` : '')
             + `</div>`;
           const tailBanner = panelState === 'running' ? ''
             : `<div style="margin-top:12px;padding:10px 12px;border:1px solid ${color};border-radius:8px;color:${color};font-weight:600">${headText}，完整结果与回放视频见对话页</div>`;
@@ -412,10 +436,14 @@ export function installQiyuanBridge() {
       reservation.sdk = sdk;
       abort.signal.throwIfAborted();
       pushTip('任务已下发，正在启动…');
+      for (const notice of navigationNotices) {
+        steps.push({ kind: '导航', text: notice, status: 'done', ts: Date.now() });
+      }
+      if (navigationNotices.length) pushTip(navigationNotices[navigationNotices.length - 1]);
       let outcome: unknown;
       // 模型只看截图看不到 href，「带链接」类需求会逼它诚实认输。提前声明：
       // 链接由系统自动提取，它只需浏览阅读，不用记录网址。
-      const actPrompt = `${prompt}\n\n（如果完成任务必须先由用户提供缺失信息或作出选择，使用 AskUser 动作提出明确问题，等待答复；不要猜测或继续执行，也不要在同一轮安排其他动作。不要询问密码、验证码或支付凭据。）\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。注意：任务从一个空白新标签页开始——需要浏览网页时请直接用「浏览」动作打开合适的网站（如 Google/Bing 搜索、任务或对话上下文里提到的站点），主动搜索任务主题；当前页空白不是放弃的理由，禁止因为页面空白就结束任务。站点直达要求：如果任务（或对话上下文）指定了具体网站/平台（如抖音、小红书、B站、知乎、微博、淘宝、X、Reddit 等），必须用「浏览」直接打开该网站官网，并用它的站内搜索功能搜索任务关键词；禁止只用 Google 搜索或 site: 语法代替站内搜索——用户要的是该平台站内 browse 到的热门内容（点赞/热度信息只有站内才看得到）。任务点名多个网站时逐站完成，不要遗漏。效率要求：搜索结果每页约 10 条，浏览 5–8 页通常就足够；标题和摘要级别的候选即可计入结果，不需要逐个打开帖子核实正文，也不要因为"摘要不够详细""可能是转述"这类理由排除候选——判断是否与此前结果重复只看标题或链接是否相同。收集到任务要求数量的候选后必须立即停止浏览；连续两页没有新的相关结果时也必须停止，然后正常结束任务。）`;
+      const actPrompt = `${prompt}\n\n（如果完成任务必须先由用户提供缺失信息或作出选择，使用 AskUser 动作提出明确问题，等待答复；不要猜测或继续执行，也不要在同一轮安排其他动作。不要询问密码、验证码或支付凭据。）\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。注意：任务已打开与指令匹配的起始页；后续需要浏览网页时请直接用「浏览」动作打开合适的网站（如百度/必应搜索、任务或对话上下文里提到的站点），主动搜索任务主题；当前页空白不是放弃的理由，禁止因为页面空白就结束任务。站点直达要求：如果任务（或对话上下文）指定了具体网站/平台（如百度、抖音、小红书、B站、知乎、微博、淘宝、X、Reddit 等），必须用「浏览」直接打开该网站官网，并用它的站内搜索功能搜索任务关键词；禁止只用 Google 搜索或 site: 语法代替站内搜索——用户要的是该平台站内 browse 到的热门内容（点赞/热度信息只有站内才看得到）。明确指定百度时只能在百度完成，禁止改用 Google 或其他搜索引擎。后续浏览动作遇到网络错误时，未限定网站就尝试百度/必应备用入口；限定网站就尝试该站备用入口，不要在第一次访问失败后直接结束。任务点名多个网站时逐站完成，不要遗漏。效率要求：搜索结果每页约 10 条，浏览 5–8 页通常就足够；标题和摘要级别的候选即可计入结果，不需要逐个打开帖子核实正文，也不要因为"摘要不够详细""可能是转述"这类理由排除候选——判断是否与此前结果重复只看标题或链接是否相同。收集到任务要求数量的候选后必须立即停止浏览；连续两页没有新的相关结果时也必须停止，然后正常结束任务。）`;
       // 汇总提示：把执行中采集到的真实链接列表交给模型，只允许用这些链接。
       const buildSummaryPrompt = (limitNote: string) => {
         const links = linkCorpusText();
@@ -581,6 +609,9 @@ export function installQiyuanBridge() {
       let finalOutcome: Record<string, unknown> = outcome && typeof outcome === 'object' && !Array.isArray(outcome)
         ? { ...(slim(outcome) as Record<string, unknown>), ...uploadOutcome }
         : { result: slim(outcome), ...uploadOutcome };
+      if (navigationNotices.length && typeof finalOutcome.result === 'string' && finalOutcome.result.trim()) {
+        finalOutcome.result += `\n\n${navigationNotices.join('\n')}`;
+      }
       const byteLen = (o: unknown) => new TextEncoder().encode(JSON.stringify(o)).byteLength;
       if (byteLen(finalOutcome) > 200 * 1024) {
         // Still oversized: keep only the answer-shaped fields.
