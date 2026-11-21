@@ -8,6 +8,7 @@ import { ChromeExtensionProxyPage, ChromeExtensionProxyPageAgent } from '@midsce
 import { saveReplayVideo } from '../replay-store';
 import { clarificationAction } from './clarification';
 import { navigateWithFailover, selectStartUrls } from './qiyuan-navigation';
+import { collectionPlatforms, normalizeObservations, observationBatches, type Observation } from './qiyuan-observations';
 
 // Prototype only: endpoints require a backend that does not yet exist.
 const SITE = 'https://ai.qykaiwu.cn';
@@ -33,6 +34,19 @@ export function installQiyuanBridge() {
       if (typeof message.modelFamily !== 'string' || !supportedFamilies.includes(message.modelFamily)) throw new Error('Unsupported or missing server model family');
       const reservation = { id: message.taskId as string, capability: message.capability as string, abort: new AbortController(), sdk: undefined as PlaygroundSDK | undefined, agent: undefined as ChromeExtensionProxyPageAgent | undefined };
       active = reservation;
+      // ACK only after validation and reservation, before any navigation or other
+      // potentially slow browser API. The worker can then release its channel.
+      respond({ ok: true, taskId: message.taskId, started: true, version: chrome.runtime.getManifest().version });
+      const abort = reservation.abort;
+      const url = `${SITE}/api/browser-plugin/tasks/${message.taskId}`;
+      const request = async (path: string, data: unknown, signal?: AbortSignal) => {
+        const signals = [signal, AbortSignal.timeout(180_000)].filter((s): s is AbortSignal => !!s);
+        const res = await fetch(`${url}/${path}`, { method: 'POST', credentials: 'omit', redirect: 'error', signal: AbortSignal.any(signals), headers: { 'content-type': 'application/json', authorization: `Bearer ${message.capability}` }, body: JSON.stringify(data) });
+        if (!res.ok) throw new Error(`Backend HTTP ${res.status}`);
+        return res.json();
+      };
+      try {
+      void request('progress', { tip: '正在启动浏览器任务', steps: [], totalSteps: 0 }, abort.signal).catch(() => {});
       // Open a fresh tab for every task: the chat page and the user's other
       // tabs are never navigated, and the model drives this tab end to end.
       // The explicit 「使用浏览器插件」 prefix is the user's consent, so no
@@ -41,6 +55,24 @@ export function installQiyuanBridge() {
       // 只匹配用户本次的指令文本，不匹配对话上下文里提到的旧站点。
       const userIntent = prompt.split('【对话上下文')[0];
       const startUrls = selectStartUrls(userIntent);
+      const observationPlatforms = collectionPlatforms(userIntent);
+      const observations: Observation[] = [];
+      const observationKeys = new Set<string>();
+      let observationQueue: Promise<void> = Promise.resolve();
+      const saveObservations = (items: Observation[]) => {
+        const fresh = items.filter(item => {
+          const key = `${item.platform}|${item.title}`;
+          if (observationKeys.has(key)) return false;
+          observationKeys.add(key);
+          return true;
+        });
+        observations.push(...fresh);
+        for (const batch of observationBatches(fresh)) {
+          observationQueue = observationQueue.then(async () => {
+            try { await request('progress', { tip: '正在保存已读记录', observations: batch }, undefined); } catch { /* result retains the evidence */ }
+          });
+        }
+      };
       const navigationNotices: string[] = [];
       // Reuse only a page explicitly identified in this turn, never a URL in chat history.
       const existing = /(?:已经?|当前|正在)(?:在浏览器(?:中|里)?)?(?:打开|开启)(?:着)?的|已打开的/.exec(userIntent);
@@ -79,23 +111,6 @@ export function installQiyuanBridge() {
           await new Promise(r => setTimeout(r, 200));
         }
       } catch { /* 页面消失或查询失败，继续由后续步骤报错 */ }
-      // Acknowledge immediately: the task may run for minutes, and an MV3
-      // service worker waiting on this respond can be killed mid-wait, which
-      // would leave the chat page stuck forever. From here on the page
-      // tracks the task by polling the backend, so the final state must
-      // always reach /result — even when the steps below fail.
-      respond({ ok: true, taskId: message.taskId, started: true, version: chrome.runtime.getManifest().version });
-      const abort = reservation.abort;
-      const url = `${SITE}/api/browser-plugin/tasks/${message.taskId}`;
-      const request = async (path: string, data: unknown, signal?: AbortSignal) => {
-        // Bound every backend call: an upstream stall must not freeze the task
-        // forever (the chat page would wait silently for the full 2h TTL).
-        const signals = [signal, AbortSignal.timeout(180_000)].filter((s): s is AbortSignal => !!s);
-        const res = await fetch(`${url}/${path}`, { method: 'POST', credentials: 'omit', redirect: 'error', signal: AbortSignal.any(signals), headers: { 'content-type': 'application/json', authorization: `Bearer ${message.capability}` }, body: JSON.stringify(data) });
-        if (!res.ok) throw new Error(`Backend HTTP ${res.status}`);
-        return res.json();
-      };
-      try {
       // Live progress: the agent's aiAct progress bus carries structured
       // per-step events (plan_thinking / plan_planned / action_running /
       // action_done with durationMs). We keep a Midscene-report-like step
@@ -357,6 +372,48 @@ export function installQiyuanBridge() {
           }
         } catch { /* 页面忙/导航中，跳过本次采集 */ }
       };
+      // Read only visible content from the actual platform page. Search-result cards
+      // are evidence; links harvested elsewhere are never promoted into records.
+      const harvestObservations = async () => {
+        if (!observationPlatforms.length) return;
+        try {
+          const res: any = await page.evaluateJavaScript(`(() => {
+            const host = location.hostname.toLowerCase();
+            const platform = host.endsWith('xiaohongshu.com') ? '小红书' : host.endsWith('douyin.com') ? '抖音' : host.endsWith('zhihu.com') ? '知乎' : '';
+            if (!platform) return [];
+            const out = [];
+            for (const a of document.querySelectorAll('a[href]')) {
+              if (!a.getClientRects().length || a.closest('nav,header,footer,aside')) continue;
+              const h = a.href;
+              if (platform === '小红书' && !/\\/(explore|discovery\\/item)\\//.test(h)) continue;
+              if (platform === '抖音' && !/\\/(video|note)\\//.test(h)) continue;
+              if (platform === '知乎' && !/\\/(question\\/\\d+\\/answer|p)\\//.test(h)) continue;
+              const card = a.closest('article, section, [class*="card" i], [class*="item" i]') || a;
+              const titleNode = card.querySelector('[class*="title" i], h1, h2, h3');
+              const title = (titleNode?.innerText || a.innerText || '').replace(/\\s+/g, ' ').trim();
+              const author = (card.querySelector('[class*="author" i], [class*="user" i]')?.innerText || '').replace(/\\s+/g, ' ').trim();
+              const text = (card.innerText || '').replace(/\\s+/g, ' ');
+              const time = (text.match(/(?:\\d+\\s*(?:天|小时|分钟|周|个月|年)前|昨天|今天|\\d{4}[-/.]\\d{1,2}[-/.]\\d{1,2})/) || [])[0] || '';
+              if (title) out.push({ platform, title, author, time, url: h });
+              if (out.length >= 50) break;
+            }
+            if (platform !== '知乎') {
+              for (const node of document.querySelectorAll('article h3,section h3,[class*="card" i] [class*="title" i],[class*="item" i] [class*="title" i],[data-e2e*="title"]')) {
+                if (!node.getClientRects().length || node.closest('nav,header,footer,aside')) continue;
+                const card = node.closest('article,section,li,[class*="card" i],[class*="item" i]');
+                const title = (node.innerText || '').trim();
+                if (!card || !title || out.some(x => x.title === title)) continue;
+                const author = (card.querySelector('[class*="author" i],[data-e2e*="author"]')?.innerText || '').trim();
+                const time = ((card.innerText || '').match(/(?:\\d+\\s*(?:天|小时|分钟|周|个月)前|昨天|今天)/) || [''])[0];
+                if (author || time) out.push({ platform, title, author, time, url: '' });
+                if (out.length >= 50) break;
+              }
+            }
+            return out;
+          })()`);
+          saveObservations(normalizeObservations(res?.result?.value ?? res?.value ?? res, observationPlatforms));
+        } catch { /* page may be navigating */ }
+      };
       const linkCorpusText = () => {
         const lines: string[] = [];
         for (const p of linkCorpus) {
@@ -419,6 +476,7 @@ export function installQiyuanBridge() {
               if (event.phase === 'action_done' && Date.now() - lastHarvestAt > 5000) {
                 lastHarvestAt = Date.now();
                 void harvestLinks();
+                void harvestObservations();
               }
             } else if (event.phase === 'plan_failed') {
               const s = lastRunning(() => true);
@@ -443,7 +501,7 @@ export function installQiyuanBridge() {
       let outcome: unknown;
       // 模型只看截图看不到 href，「带链接」类需求会逼它诚实认输。提前声明：
       // 链接由系统自动提取，它只需浏览阅读，不用记录网址。
-      const actPrompt = `${prompt}\n\n（如果完成任务必须先由用户提供缺失信息或作出选择，使用 AskUser 动作提出明确问题，等待答复；不要猜测或继续执行，也不要在同一轮安排其他动作。不要询问密码、验证码或支付凭据。）\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。注意：任务已打开与指令匹配的起始页；后续需要浏览网页时请直接用「浏览」动作打开合适的网站（如百度/必应搜索、任务或对话上下文里提到的站点），主动搜索任务主题；当前页空白不是放弃的理由，禁止因为页面空白就结束任务。站点直达要求：如果任务（或对话上下文）指定了具体网站/平台（如百度、抖音、小红书、B站、知乎、微博、淘宝、X、Reddit 等），必须用「浏览」直接打开该网站官网，并用它的站内搜索功能搜索任务关键词；禁止只用 Google 搜索或 site: 语法代替站内搜索——用户要的是该平台站内 browse 到的热门内容（点赞/热度信息只有站内才看得到）。明确指定百度时只能在百度完成，禁止改用 Google 或其他搜索引擎。后续浏览动作遇到网络错误时，未限定网站就尝试百度/必应备用入口；限定网站就尝试该站备用入口，不要在第一次访问失败后直接结束。任务点名多个网站时逐站完成，不要遗漏。效率要求：搜索结果每页约 10 条，浏览 5–8 页通常就足够；标题和摘要级别的候选即可计入结果，不需要逐个打开帖子核实正文，也不要因为"摘要不够详细""可能是转述"这类理由排除候选——判断是否与此前结果重复只看标题或链接是否相同。收集到任务要求数量的候选后必须立即停止浏览；连续两页没有新的相关结果时也必须停止，然后正常结束任务。）`;
+      const actPrompt = `${prompt}\n\n（如果完成任务必须先由用户提供缺失信息或作出选择，使用 AskUser 动作提出明确问题，等待答复；不要猜测或继续执行，也不要在同一轮安排其他动作。不要询问密码、验证码或支付凭据。）\n\n（提示：你只需浏览和阅读页面内容；如果任务要求附带原文链接，页面上的真实链接会在任务结束时由系统自动提取，不需要你逐个记录或抄写网址。注意：任务已打开与指令匹配的起始页；后续需要浏览网页时请直接用「浏览」动作打开合适的网站（如百度/必应搜索、任务或对话上下文里提到的站点），主动搜索任务主题；当前页空白不是放弃的理由，禁止因为页面空白就结束任务。站点直达要求：如果任务（或对话上下文）指定了具体网站/平台（如百度、抖音、小红书、B站、知乎、微博、淘宝、X、Reddit 等），必须用「浏览」直接打开该网站官网，并用它的站内搜索功能搜索任务关键词；禁止只用 Google 搜索或 site: 语法代替站内搜索——用户要的是该平台站内 browse 到的热门内容（点赞/热度信息只有站内才看得到）。明确指定百度时只能在百度完成，禁止改用 Google 或其他搜索引擎。后续浏览动作遇到网络错误时，未限定网站就尝试百度/必应备用入口；限定网站就尝试该站备用入口，不要在第一次访问失败后直接结束。任务点名多个网站时逐站完成，不要遗漏。效率要求：搜索结果每页约 10 条，浏览 5–8 页通常就足够；标题和摘要级别的候选即可计入结果，不需要逐个打开帖子核实正文，也不要因为"摘要不够详细""可能是转述"这类理由排除候选——判断是否与此前结果重复只看标题或链接是否相同。候选够数不代表完成；先整理可配对的记录交给服务端验收。连续两页没有新结果时换查询词或切换缺失的平台。）`;
       // 汇总提示：把执行中采集到的真实链接列表交给模型，只允许用这些链接。
       const buildSummaryPrompt = (limitNote: string) => {
         const links = linkCorpusText();
@@ -454,11 +512,12 @@ export function installQiyuanBridge() {
           const text = lines.join('\n');
           return text.length > 9000 ? text.slice(-9000) : text;
         })();
+        const evidence = observationPlatforms.length ? `\n已在实际平台页面看到的结构化记录（仅供筛选，未经观察的链接候选不是记录）：${JSON.stringify(observations).slice(0, 20000)}\n优先保留同一卡片 DOM 中的作品网址。仅当本次用户允许该平台不附链接时，该行才可以不带链接；不要为免链接的平台点开分享页。` : '';
         const linkBlock = links
           ? `\n\n以下是执行过程中从页面 DOM 提取的真实链接列表（锚文本 → 网址）。表格每一行的「链接」列必须写成可点击的 markdown 链接（格式：[查看原文](网址)），网址必须只取自下面列表，按锚文本与条目标题的相似度配对，禁止编造或猜测任何不在列表中的链接；列表里找不到合适链接的条目，该行链接列留空并注明"链接缺失"：\n${links}`
           : '\n\n注意：本次未能从页面提取到任何真实链接。如果任务要求附带链接，如实说明无法获取链接，绝对不要编造网址，也不要声称链接会由系统附上。';
         const notesBlock = notes ? `\n\n以下是执行过程中每一步的观察笔记（各步骤看到的结果条目都记录在内）。结果表格的条目必须主要来自这些笔记，绝对不要只凭最后一页看到的内容概述，也不要只给笼统总结：\n${notes}` : '';
-        return `用户要求在网页上完成：「${prompt}」。${limitNote}请基于下方观察笔记和当前页面内容，用中文输出用户想要的结果本身。硬性格式要求：只要任务要求返回若干条结果（如前 N 条/列表/汇总），输出必须是一个 markdown 表格，表头固定为 | 序号 | 标题 | 来源 | 链接 |，一行一条结果，逐条列出、条数尽量满足任务要求，表格不受任何字数限制；表格之外可以补一段 800 字以内的总体说明。示例行：| 1 | Introducing Claude Opus 5 | Anthropic 官网 | [查看原文](https://example.com/post) |。如果笔记里确实没有收集到任何条目，就直接说"暂无有效结果"，不要编造。${notesBlock}${linkBlock}`;
+        return `用户要求在网页上完成：「${prompt}」。${limitNote}请先根据用户当前要求逐条筛选下方 DOM 链接候选，排除导航、广告和不相关内容，不能将所有链接视为热点；再基于筛选结果、观察笔记和当前页面内容，用中文输出用户想要的结果本身。硬性格式要求：只要任务要求返回若干条结果（如前 N 条/列表/汇总），输出必须是一个 markdown 表格，表头固定为 | 序号 | 标题 | 来源 | 链接 |，一行一条结果，逐条列出、条数尽量满足任务要求，表格不受任何字数限制；表格之外可以补一段 800 字以内的总体说明。示例行：| 1 | Introducing Claude Opus 5 | Anthropic 官网 | [查看原文](https://example.com/post) |。如果笔记里确实没有收集到任何条目，就直接说"暂无有效结果"，不要编造。${notesBlock}${linkBlock}${evidence}`;
       };
       // 确定性兜底：采集到的链接直接作为数据放进结果，不依赖模型自觉。
       const flattenLinks = () => {
@@ -466,7 +525,7 @@ export function installQiyuanBridge() {
         for (const p of linkCorpus) {
           for (const l of p.links) {
             out.push({ t: l.t, h: l.h, page: p.title || p.page });
-            if (out.length >= 100) return out;
+            if (out.length >= 400) return out;
           }
         }
         return out;
@@ -495,12 +554,14 @@ export function installQiyuanBridge() {
         }
         return out;
       };
+      const taskPrompt = observationPlatforms.length ? `${actPrompt}\n\n从同一结果卡片读取作品原文链接。用户明确免链的平台拿不到网址也记录，不要逐条打开分享面板；其他平台按本次指令核对原文。只记录页面实际看到且与任务相关的条目，不要把计划或链接池当作已读结果。` : actPrompt;
+      const deadline = AbortSignal.any([abort.signal, AbortSignal.timeout(30 * 60_000)]);
       try {
         // Hard cap: if the agent loop stalls (dead page, wedged navigation),
         // abort so /result is still posted while this context is alive. The
         // backend watchdog (15 min silence) is the fallback if WE die instead.
-        const actSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(30 * 60_000)]);
-        outcome = await sdk.executeAction('aiAct', { type: 'aiAct', prompt: actPrompt }, { requestId: message.taskId, abortSignal: actSignal });
+        const actSignal = deadline;
+        outcome = await sdk.executeAction('aiAct', { type: 'aiAct', prompt: taskPrompt }, { requestId: message.taskId, abortSignal: actSignal });
         if (clarificationFailed) throw new Error('无法取得用户答复，已安全停止任务');
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -513,30 +574,62 @@ export function installQiyuanBridge() {
         // 任何 aiAct 失败（超步数、动作失败、模型放弃等）都不直接把英文报错
         // 糊给用户：先采集一次当前页链接，再基于已完成的工作汇总部分结果。
         pushTip(/planning cycle limit|replanningCycleLimit/i.test(errorMessage) ? '已达步数上限，正在汇总已完成部分…' : '任务中途受挫，正在汇总已完成部分…');
-        await harvestLinks();
-        let partialSummary = '';
-        try {
-          const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: buildSummaryPrompt('任务因故被提前结束。') }, { requestId: `${message.taskId}-partial`, abortSignal: abort.signal });
-          partialSummary = injectLinks(typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : ''));
-        } catch { /* 汇总失败时给出兜底文案 */ }
-        outcome = { result: partialSummary.trim() || `任务未能完成：${errorMessage}`, partial: true };
+        outcome = { error: errorMessage, partial: true };
         }
       }
       // aiAct 只描述"做了什么动作"；用户要的是页面上的实际内容。
       // 任务成功后追加一次 aiAsk，基于当前页面总结与指令相关的内容。
-      if (!(outcome && typeof outcome === 'object' && ('error' in (outcome as Record<string, unknown>) || 'partial' in (outcome as Record<string, unknown>)))) {
+      if (!abort.signal.aborted && !clarificationFailed && !deadline.aborted) {
         pushTip('正在汇总结果…');
         await harvestLinks(); // 汇总前再采集一次，确保最后一页的链接也在语料库里
+        await harvestObservations();
         pushTip(seenHrefs.size ? `已采集到 ${seenHrefs.size} 条页面真实链接，正在汇总…` : '未能从页面提取到链接，正在汇总…');
         try {
-          const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: buildSummaryPrompt('') }, { requestId: `${message.taskId}-ask`, abortSignal: abort.signal });
+          const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: buildSummaryPrompt('') }, { requestId: `${message.taskId}-ask`, abortSignal: deadline });
           const answer = injectLinks(typeof asked === 'string' ? asked : (asked && typeof asked === 'object' ? String((asked as Record<string, unknown>).result ?? (asked as Record<string, unknown>).thought ?? '') : ''));
           if (answer.trim()) {
             outcome = outcome && typeof outcome === 'object' && !Array.isArray(outcome)
-              ? { ...(outcome as Record<string, unknown>), result: answer }
+              ? { ...(outcome as Record<string, unknown>), error: null, result: answer }
               : { result: answer };
           }
         } catch { /* 摘要失败不阻断，保留原 outcome */ }
+      }
+      // The server is the sole authority on whether a collection task is complete.
+      // Its inactive response leaves unrelated browser tasks on their normal path.
+      if (!abort.signal.aborted && !clarificationFailed && !deadline.aborted) {
+        type Checkpoint = { active: boolean; ok: boolean; summary: string; result: string; missing_platforms?: string[] };
+        const answerText = () => typeof outcome === 'string' ? outcome : String((outcome as Record<string, unknown> | null)?.result ?? '');
+        try {
+          let check = await request('checkpoint', { links: flattenLinks(), observations, answer: answerText() }, deadline) as Checkpoint;
+          let round = 0;
+          while (check.active && !check.ok && !deadline.aborted && round < 4) {
+            const previous = check.result;
+            const missing = check.missing_platforms?.join('、') || check.summary || '尚未满足的要求';
+            pushTip(`验收未通过，正在补采：${missing}`);
+            try {
+              await sdk.executeAction('aiAct', { type: 'aiAct', prompt: `${actPrompt}\n\n这是补采，不要重做已有记录。服务端指出缺口：${missing}。已有结果：\n${previous}\n请针对缺口浏览并记录相关候选。` }, { requestId: `${message.taskId}-retry-${round}`, abortSignal: deadline });
+            } catch { if (deadline.aborted) break; }
+            await harvestLinks();
+            if (deadline.aborted) break;
+            try {
+              const asked: unknown = await sdk.executeAction('aiAsk', { type: 'aiAsk', prompt: `${buildSummaryPrompt('这是补采后的合并汇总。')}\n\n此前已采集并验收过的记录，必须保留并去重：\n${previous}\n只把符合用户当前要求的候选纳入表格，不得把全部 DOM 链接当作结果。` }, { requestId: `${message.taskId}-merge-${round}`, abortSignal: deadline });
+              const text = typeof asked === 'string' ? asked : String((asked as Record<string, unknown> | null)?.result ?? (asked as Record<string, unknown> | null)?.thought ?? '');
+              if (text.trim()) outcome = { result: injectLinks(text), partial: true };
+            } catch { if (deadline.aborted) break; }
+            const merged = [previous, answerText()].filter(Boolean).join('\n\n');
+            check = await request('checkpoint', { links: flattenLinks(), observations, answer: merged }, deadline) as Checkpoint;
+            if (!check.ok && check.result) {
+              check = await request('checkpoint', { links: flattenLinks(), observations, answer: check.result }, deadline) as Checkpoint;
+            }
+            round++;
+          }
+          if (check.active) outcome = { result: check.result || answerText() || check.summary, partial: !check.ok };
+        } catch {
+          if (!abort.signal.aborted) outcome = { result: answerText() || '未能完成验收，请稍后重试。', partial: true };
+        }
+      } else if (deadline.aborted && !abort.signal.aborted && !clarificationFailed) {
+        const current = outcome && typeof outcome === 'object' ? outcome as Record<string, unknown> : {};
+        outcome = { result: String(current.result || '已达到时间上限，未能完成采集。'), partial: true };
       }
       // Best-effort terminal artifact: replay video. Rendered locally and kept
       // in the extension's IndexedDB — never uploaded, so the server spends
@@ -609,20 +702,21 @@ export function installQiyuanBridge() {
       let finalOutcome: Record<string, unknown> = outcome && typeof outcome === 'object' && !Array.isArray(outcome)
         ? { ...(slim(outcome) as Record<string, unknown>), ...uploadOutcome }
         : { result: slim(outcome), ...uploadOutcome };
+      const fullAnswer = typeof outcome === 'string' ? outcome : (outcome as { result?: unknown } | null)?.result;
+      if (typeof fullAnswer === 'string' && !fullAnswer.startsWith('data:')) finalOutcome.result = fullAnswer;
       if (navigationNotices.length && typeof finalOutcome.result === 'string' && finalOutcome.result.trim()) {
         finalOutcome.result += `\n\n${navigationNotices.join('\n')}`;
       }
       const byteLen = (o: unknown) => new TextEncoder().encode(JSON.stringify(o)).byteLength;
+      if (observations.length) finalOutcome.observations = observations.slice(0, 200);
       if (byteLen(finalOutcome) > 200 * 1024) {
-        // Still oversized: keep only the answer-shaped fields.
-        const o = finalOutcome as Record<string, unknown>;
-        finalOutcome = {
-          result: String(o.result ?? o.thought ?? o.output ?? o.text ?? '任务已完成').slice(0, 8000),
-          ...uploadOutcome,
-        };
+        const { result, error, partial } = finalOutcome;
+        const text = String(result ?? '');
+        finalOutcome = { result: text, error, partial, videoAvailable, steps: finalSteps, totalSteps: steps.length,
+          links: harvestedLinks.filter(l => text.includes(l.h)) };
       }
       if (byteLen(finalOutcome) > 200 * 1024) {
-        finalOutcome = { result: '任务已完成（结果超出对话容量，请回看过程视频）', ...uploadOutcome };
+        finalOutcome = { partial: true, result: '结果超出对话容量，未能交付完整表格。', videoAvailable };
       }
       // 面板终态：和对话页同一口径（取消/失败/完成 + 结果摘要）。
       // 注意必须判值非空而非键存在——aiAct 的 outcome 固定带 error:null。
@@ -630,6 +724,7 @@ export function installQiyuanBridge() {
       panelState = clarificationFailed ? 'failed' : abort.signal.aborted ? 'cancelled' : (outcomeError != null && outcomeError !== '' ? 'failed' : 'done');
       panelResultText = String((finalOutcome as Record<string, unknown>).result ?? outcomeError ?? '').slice(0, 2000);
       postProgress(true); // flush the complete timeline before the terminal post
+      await observationQueue;
       await request('result', { outcome: finalOutcome, cancelled: abort.signal.aborted && !clarificationFailed });
       } catch (error) {
         // 面板变量都声明在 try 块内、catch 里不可见；如果面板已渲染过，直接
