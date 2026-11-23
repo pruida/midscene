@@ -372,9 +372,9 @@ export default function Bridge() {
               <h2 className="mode-title">Bridge Mode</h2>
             </div>
             <p className="bridge-mode-description">
-              In Bridge Mode, you can control this browser by 启源开物浏览器助手 SDK
-              running in the local terminal. This is useful for interacting both
-              through scripts and manually, or to reuse cookies.{' '}
+              In Bridge Mode, you can control this browser by 启源开物浏览器助手
+              SDK running in the local terminal. This is useful for interacting
+              both through scripts and manually, or to reuse cookies.{' '}
               <a
                 href="https://www.midscenejs.com/bridge-mode-by-chrome-extension"
                 target="_blank"

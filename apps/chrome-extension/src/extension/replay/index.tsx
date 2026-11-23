@@ -45,7 +45,9 @@ async function main() {
     wrap.appendChild(video);
     root.appendChild(wrap);
   } catch (error) {
-    showMessage(`读取回放失败：${error instanceof Error ? error.message : String(error)}`);
+    showMessage(
+      `读取回放失败：${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 

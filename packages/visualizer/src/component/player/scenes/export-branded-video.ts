@@ -473,9 +473,11 @@ async function runExportBrandedVideo(
   // In timer-driven (hidden-page) mode the compositor never paints, so
   // captureStream(fps) would emit no frames; request each frame explicitly.
   const manualCaptureTrack = timerDriven
-    ? (stream.getVideoTracks()[0] as unknown as {
-        requestFrame?: () => void;
-      } | undefined)
+    ? (stream.getVideoTracks()[0] as unknown as
+        | {
+            requestFrame?: () => void;
+          }
+        | undefined)
     : undefined;
   const recorder = new MediaRecorder(stream, {
     mimeType: 'video/webm',
@@ -572,9 +574,12 @@ async function runExportBrandedVideo(
 
     const scheduleNextFrame = () => {
       if (timerDriven) {
-        renderTimer = setTimeout(() => {
-          renderFrame(performance.now());
-        }, Math.max(0, nextFrameDueAt - performance.now()));
+        renderTimer = setTimeout(
+          () => {
+            renderFrame(performance.now());
+          },
+          Math.max(0, nextFrameDueAt - performance.now()),
+        );
         return;
       }
       const delay = Math.max(0, nextFrameDueAt - performance.now());

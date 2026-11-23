@@ -26,12 +26,19 @@ function openDb(): Promise<IDBDatabase> {
   });
 }
 
-export async function saveReplayVideo(taskId: string, blob: Blob): Promise<void> {
+export async function saveReplayVideo(
+  taskId: string,
+  blob: Blob,
+): Promise<void> {
   const db = await openDb();
   try {
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE, 'readwrite');
-      tx.objectStore(STORE).put({ taskId, createdAt: Date.now(), blob } satisfies ReplayVideoRow);
+      tx.objectStore(STORE).put({
+        taskId,
+        createdAt: Date.now(),
+        blob,
+      } satisfies ReplayVideoRow);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
@@ -61,12 +68,14 @@ export async function saveReplayVideo(taskId: string, blob: Blob): Promise<void>
 export async function getReplayVideo(taskId: string): Promise<Blob | null> {
   const db = await openDb();
   try {
-    const row = await new Promise<ReplayVideoRow | undefined>((resolve, reject) => {
-      const tx = db.transaction(STORE, 'readonly');
-      const req = tx.objectStore(STORE).get(taskId);
-      req.onsuccess = () => resolve(req.result as ReplayVideoRow | undefined);
-      req.onerror = () => reject(req.error);
-    });
+    const row = await new Promise<ReplayVideoRow | undefined>(
+      (resolve, reject) => {
+        const tx = db.transaction(STORE, 'readonly');
+        const req = tx.objectStore(STORE).get(taskId);
+        req.onsuccess = () => resolve(req.result as ReplayVideoRow | undefined);
+        req.onerror = () => reject(req.error);
+      },
+    );
     return row?.blob ?? null;
   } finally {
     db.close();

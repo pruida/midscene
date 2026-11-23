@@ -15,7 +15,14 @@ const SITE_STARTS: Array<[RegExp, string[]]> = [
   // An explicitly named platform remains authoritative. In particular, a
   // Baidu request must never be silently converted into a Google search.
   [/百度|baidu/i, ['https://www.baidu.com/', 'https://m.baidu.com/']],
-  [/谷歌|google/i, ['https://www.google.com/', 'https://www.bing.com/', 'https://www.baidu.com/']],
+  [
+    /谷歌|google/i,
+    [
+      'https://www.google.com/',
+      'https://www.bing.com/',
+      'https://www.baidu.com/',
+    ],
+  ],
   [/必应|bing/i, ['https://www.bing.com/', 'https://www.baidu.com/']],
   [/抖音|douyin/i, ['https://www.douyin.com/']],
   [/小红书|xiaohongshu|redbook/i, ['https://www.xiaohongshu.com/']],
@@ -34,10 +41,12 @@ export function selectStartUrls(userIntent: string): string[] {
   const match = SITE_STARTS.find(([pattern]) => pattern.test(userIntent));
   // Mainland-safe default. Google remains available only when the user names it,
   // with disclosed fallback if that network path is unavailable.
-  return [...(match?.[1] ?? ['https://www.baidu.com/', 'https://www.bing.com/'])];
+  return [
+    ...(match?.[1] ?? ['https://www.baidu.com/', 'https://www.bing.com/']),
+  ];
 }
 
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Navigate one controlled tab through a bounded list of initial-page candidates. */
 export async function navigateWithFailover(
@@ -56,13 +65,23 @@ export async function navigateWithFailover(
     signal.throwIfAborted();
     const url = urls[index];
     let networkError = '';
-    const onError = (details: { tabId: number; frameId: number; error: string }) => {
-      if (details.tabId === tabId && details.frameId === 0 && details.error !== 'net::ERR_ABORTED') {
+    const onError = (details: {
+      tabId: number;
+      frameId: number;
+      error: string;
+    }) => {
+      if (
+        details.tabId === tabId &&
+        details.frameId === 0 &&
+        details.error !== 'net::ERR_ABORTED'
+      ) {
         networkError = details.error;
       }
     };
     chrome.webRequest.onErrorOccurred.addListener(onError, {
-      urls: ['http://*/*', 'https://*/*'], tabId, types: ['main_frame'],
+      urls: ['http://*/*', 'https://*/*'],
+      tabId,
+      types: ['main_frame'],
     });
     try {
       await chrome.tabs.update(tabId, { url, active: true });
@@ -87,7 +106,9 @@ export async function navigateWithFailover(
       options.onFallback?.({
         from: url,
         to: next,
-        reason: networkError || (error instanceof Error ? error.message : String(error)),
+        reason:
+          networkError ||
+          (error instanceof Error ? error.message : String(error)),
       });
     } finally {
       chrome.webRequest.onErrorOccurred.removeListener(onError);

@@ -320,8 +320,12 @@ export default class ChromeExtensionProxyPage implements AbstractInterface {
     try {
       const tabId = await this.getTabIdOrConnectToCurrentTab();
       await Promise.race([
-        chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', { expression }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('cosmetic eval timeout')), 3000)),
+        chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+          expression,
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('cosmetic eval timeout')), 3000),
+        ),
       ]);
     } catch (error) {
       console.warn('Cosmetic CDP command skipped:', error);
@@ -439,14 +443,20 @@ export default class ChromeExtensionProxyPage implements AbstractInterface {
    */
   private static readonly CDP_COMMAND_TIMEOUT_MS = 20000;
 
-  private sendCommandWithTimeout(tabId: number, command: string, params: unknown): Promise<any> {
+  private sendCommandWithTimeout(
+    tabId: number,
+    command: string,
+    params: unknown,
+  ): Promise<any> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         // Input events are queued by the browser even when the renderer main
         // thread is busy — the click/wheel DID land (observed on wedged
         // infinite-scroll pages), so a missing ack must not fail the action.
         if (command.startsWith('Input.')) {
-          console.warn(`CDP command "${command}" ack timed out; treating queued input as delivered`);
+          console.warn(
+            `CDP command "${command}" ack timed out; treating queued input as delivered`,
+          );
           resolve(undefined);
           return;
         }
